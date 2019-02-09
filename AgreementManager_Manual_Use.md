@@ -18,11 +18,11 @@ If createAgreementA is the only function that has been called so far, you can ge
 
 **(3) Use Remix to interact with the contract**
 
-Go to https://remix.ethereum.org, paste the contract code listed on Etherscan into the code window on Remix. Make sure the compiler version matches the compiler version at the top of the code file, then compile the code on Remix.
+Go to https://remix.ethereum.org, paste the contract code listed on Etherscan into the code window on Remix. Make sure the compiler version matches the compiler version at the top of the code file, then compile the code with Remix.
 
 Go to the 'run' tab on Remix and paste the address of the contract after the 'At Address' label. Click 'At Address'. The contract should now appear under 'deployed contracts'. Expand this contract to see the functions you can call.
 
-You'll need to pass in the agreement ID to most of these functions. Some functions also require a 'resolution', which is the amount of funds that the party who created the agreement (referred to as "party A" in the code) should recieve. If you're unsure who is "party A", use Remix to call "getState" and it will list the addresses of the agreement in the order: party A, party B, arbitrator.
+You'll need to pass in the agreement ID to most of these functions. Some functions also require a 'resolution', which is the amount of funds that the party who created the agreement (referred to as "party A" in the code) should recieve. The remaining funds are understood to be owed to the other party. If you're unsure who is "party A", use Remix to call "getState". The first three addresses listed will represent party A, party B, and the arbitrator.
 
 You may have to read the code to understand under whcih circumstances each function can be called. The most commonly used functions are: createAgreementA and depositB (which allow A and B to stake their funds), resolveAsParty (which A and B call to enter their resolutions), and withdraw. 
 
