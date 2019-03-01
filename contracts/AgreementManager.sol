@@ -346,6 +346,17 @@ contract AgreementManager is SafeUtils, Arbitrable, EvidenceProducer{
         return party == B;
     }
 
+    // Test whether res1 and res2 are compatible, given that res1 is given by party res1Party..
+    // Compatible means that they don't disagree in a selfish direction. 
+    // Assumes that res1 and res2 are not RESOLUTION_NULL
+    function resolutionsAreCompatible(uint res1, uint res2, uint res1Party) internal pure returns (bool){
+        if(res1Party == A){
+            return res1 <= res2;
+        } else{
+            return res1 >= res2;
+        }
+    }
+
     // Safely create a dispute using the ERC792 standard. The call to the external function 'createDispute' is untrusted,
     // so we need to wrap it in a reentrancy guard.
     // We tell the arbitation service how many choices it has and send extraData to tell it details about how the arbitration
@@ -444,6 +455,7 @@ contract AgreementManager is SafeUtils, Arbitrable, EvidenceProducer{
         }
         
         // Beyond this point we know that both parties paid the full arbitration fee.
+        // This implies they've also both resolved.
 
         // If the arbitrator didn't resolve or withdraw, that means they weren't paid. 
         // And they can never be paid, because we'll only call this function after a final resolution
@@ -456,10 +468,10 @@ contract AgreementManager is SafeUtils, Arbitrable, EvidenceProducer{
         // the full arbitration fee. So party A and party B only have a single arbitration fee to split
         // between themselves. We need to figure out how to split up that fee.
         
-        // If A and B have the same resolution, then whichever of them resolved to this value the latest 
-        // should have to pay the full fee (because if they had resolved to it earlier, the arbitrator would
+        // If A and B have compatible resolutions, then whichever of them resolved latest 
+        // should have to pay the full fee (because if they had resolved earlier, the arbitrator would
         // never have had to be called). See comments for PARTY_A_RESOLVED_LAST
-        if(agreement.partyAResolution == agreement.partyBResolution){
+        if(resolutionsAreCompatible(agreement.partyAResolution, agreement.partyBResolution, A)){ 
             if(partyResolvedLast(agreement, party)){
                 return 0;
             }else{
@@ -467,16 +479,16 @@ contract AgreementManager is SafeUtils, Arbitrable, EvidenceProducer{
             }
         }
 
-        // Beyond this point we know A and B's resolutions are different. If either of them
+        // Beyond this point we know A and B's resolutions are incompatible. If either of them
         // agree with the arbiter they should get a refund, leaving the other person with nothing.
-        if(partyResolution(agreement, party) == agreement.resolution){
+        if(resolutionsAreCompatible(partyResolution(agreement, party), agreement.resolution, party)){
             return agreement.disputeFee;
         }
-        if(partyResolution(agreement, otherParty) == agreement.resolution){
+        if(resolutionsAreCompatible(partyResolution(agreement, otherParty), agreement.resolution, otherParty)){
             return 0;
         }
 
-        // A and B's resolutions are different but unequal to the overall resolution. 
+        // A and B's resolutions are different but both incompatible with the overall resolution. 
         // Neither party was "right", so they can both split the dispute fee.
         return agreement.disputeFee/2;
     }
@@ -500,10 +512,10 @@ contract AgreementManager is SafeUtils, Arbitrable, EvidenceProducer{
         // Beyond this point we know the arbitrator has been paid. So party A and party B only have a single arbitration 
         // fee to split between themselves. We need to figure out how to split up that fee.
         
-        // If A and B have the same resolution, then whichever of them resolved to this value the latest 
+        // If A and B have a compatible resolution, then whichever of them resolved to this value the latest 
         // should have to pay the full fee (because if they had resolved to it earlier, the arbitrator would
         // never have had to be called). See comments for PARTY_A_RESOLVED_LAST
-        if(agreement.partyAResolution == agreement.partyBResolution){
+        if(resolutionsAreCompatible(agreement.partyAResolution, agreement.partyBResolution, A)){
             if(partyResolvedLast(agreement, party)){
                 return sub(arbData.weiPaidIn[party], arbData.weiPaidToArbitrator);
             }else{
@@ -511,12 +523,12 @@ contract AgreementManager is SafeUtils, Arbitrable, EvidenceProducer{
             }
         }
         
-        // Beyond this point we know A and B's resolutions are different. If either of them
+        // Beyond this point we know A and B's resolutions are incompatible. If either of them
         // agree with the arbiter they should get a refund, leaving the other person with nothing.
-        if(partyResolution(agreement, party) == agreement.resolution){
+        if(resolutionsAreCompatible(partyResolution(agreement, party), agreement.resolution, party)){
             return arbData.weiPaidIn[party]; 
         }
-        if(partyResolution(agreement, otherParty) == agreement.resolution){
+        if(resolutionsAreCompatible(partyResolution(agreement, otherParty), agreement.resolution, otherParty)){
             return sub(arbData.weiPaidIn[party], arbData.weiPaidToArbitrator); 
         }
 
@@ -724,13 +736,13 @@ contract AgreementManager is SafeUtils, Arbitrable, EvidenceProducer{
 
         setPartyResolution(agreement, party, res);
 
-        // If A and B's resolutions are the same, set the official resolution to this value.
-        // Or set the resolution to the caller's preference if they give all funds to
-        // the other person. 
-        if(res == partyResolution(agreement, otherParty) && res != RESOLUTION_NULL ||
-            party == A && res == 0 ||
-            party == B && res == add(agreement.partyAStakeAmount, agreement.partyBStakeAmount)){
-
+        // Set the official resolution if one party wants to give the other at least as much as
+        // they requested, or at least as much as the most they could request (if they haven't resolved yet).
+        uint otherRes = partyResolution(agreement, otherParty);
+        if((otherRes != RESOLUTION_NULL && resolutionsAreCompatible(res, otherRes, party)) ||
+            (party == A && res == 0) ||
+            (party == B && res == add(agreement.partyAStakeAmount, agreement.partyBStakeAmount))){
+            
             agreement.resolution = res;
         }
     }
@@ -852,6 +864,7 @@ contract AgreementManager is SafeUtils, Arbitrable, EvidenceProducer{
         bool firstArbitrationRequest = !partyRequestedArbitration(agreement, A) && !partyRequestedArbitration(agreement, B);
 
         require(!usingArbitrationStandard(agreement), "Only simple arbitration uses requestArbitration.");
+        require(agreement.arbitratorAddress != address(0), "Arbitration is disallowed.");
         require(msg.value == toWei(agreement.disputeFee), "Arbitration fee amount was incorrect.");
         require(RESOLUTION_NULL != partyResolution(agreement, party), "Need to enter a resolution before requesting arbitration.");
         require(!partyRequestedArbitration(agreement, party), "This party already requested arbitration.");
@@ -876,6 +889,7 @@ contract AgreementManager is SafeUtils, Arbitrable, EvidenceProducer{
 
         require(!preventReentrancy(agreement), "Reentrancy protection is on");
         require(usingArbitrationStandard(agreement), "Only standard arbitration uses requestStandardArbitration.");
+        require(agreement.arbitratorAddress != address(0), "Arbitration is disallowed.");
 
         (uint party, uint otherParty) = getParties(agreement);
         
@@ -929,7 +943,7 @@ contract AgreementManager is SafeUtils, Arbitrable, EvidenceProducer{
         require(!usingArbitrationStandard(agreement), "Only simple arbitration uses withdrawDisputeFee.");
         require(partyRequestedArbitration(agreement, A) && partyRequestedArbitration(agreement, B), "Arbitration not requested");
         require(msg.sender == agreement.arbitratorAddress, "withdrawDisputeFee can only be called by Arbitrator.");
-        require(agreement.partyAResolution != agreement.partyBResolution || agreement.partyAResolution == RESOLUTION_NULL, 
+        require(!resolutionsAreCompatible(agreement.partyAResolution, agreement.partyBResolution, A), 
             "partyA and partyB already resolved their dispute.");
         require(!arbitratorWithdrewDisputeFee(agreement), "Already withdrew dispute fee.");
 

@@ -361,27 +361,38 @@ contract AgreementManagerERC20 is SafeUtils, Arbitrable, EvidenceProducer{
     }
 
     // Returns true if party A and party B have entered the same resolution.
-    function partyResolutionsAreEqual(AgreementData storage agreement) internal view returns (bool){
-        return resolutionsAreEqual(
+    function partyResolutionsAreCompatible(AgreementData storage agreement) internal view returns (bool){
+        return resolutionsAreCompatible(
             agreement, agreement.partyAResolutionTokenA, agreement.partyAResolutionTokenB,
-            agreement.partyBResolutionTokenA, agreement.partyBResolutionTokenB);
+            agreement.partyBResolutionTokenA, agreement.partyBResolutionTokenB, A);
     }
 
-    // Returns whether two given resolutions are equal. (resA, resB) is one resolution, (otherA, otherB) is the other.
+    // Returns whether two given resolutions are compatible, a.k.a. not disagreeing in a selfish direction. 
+    // (resA, resB) is one resolution, (otherA, otherB) is the other.
     // The first component of each is for party A's staked token, the second component is for party B's staked token.
+    // resParty is the party corresponding to resA and resB.
     // The logic here is nontrivial because of token A and token B are the same, then the same resolution can be 
     // represented in many different ways.
-    function resolutionsAreEqual(AgreementData storage agreement, uint resA, uint resB, uint otherA, uint otherB) internal view returns (bool){
+    // This assumes neither resolution is RESOLUTION_NULL
+    function resolutionsAreCompatible(AgreementData storage agreement, uint resA, uint resB, uint otherA, uint otherB, uint resParty) 
+        internal view returns (bool){
+
         if(agreement.partyAToken != agreement.partyBToken){
-            return resA == otherA && resB == otherB;
+            if(resParty == A){
+                return resA <= otherA && resB <= otherB;
+            }else{
+                return resA >= otherA && resB >= otherB;
+            }
         }
-        // before we do the math below check the null case, otherwise math overflow
-        if(resA == RESOLUTION_NULL || otherA == RESOLUTION_NULL){
-            return resA == otherA;
+        
+        // now we know tokens are the same 
+        uint resSum = add(resolutionToWei(resA, agreement.partyATokenPower), resolutionToWei(resB, agreement.partyBTokenPower));
+        uint otherSum = add(resolutionToWei(otherA, agreement.partyATokenPower), resolutionToWei(otherB, agreement.partyBTokenPower));
+        if(resParty == A){
+            return resSum <= otherSum;
+        }else{
+            return resSum >= otherSum;
         }
-        // now we know tokens are the same and neither resolution is null
-        return add(resolutionToWei(resA, agreement.partyATokenPower), resolutionToWei(resB, agreement.partyBTokenPower)) ==
-            add(resolutionToWei(otherA, agreement.partyATokenPower), resolutionToWei(otherB, agreement.partyBTokenPower));
     }
 
     // Requires that the caller be party A or party B. Returns whichever party the caller is.
@@ -551,7 +562,7 @@ contract AgreementManagerERC20 is SafeUtils, Arbitrable, EvidenceProducer{
             return agreement.disputeFee;
         }
         
-        // Beyond this point we know that both parties paid the full arbitration fee.
+        // Beyond this point we know that both parties paid the full arbitration fee. So they both resolved.
 
         // If the arbitrator didn't resolve or withdraw, that means they weren't paid. 
         // And they can never be paid, because we'll only call this function after a final resolution
@@ -564,12 +575,12 @@ contract AgreementManagerERC20 is SafeUtils, Arbitrable, EvidenceProducer{
         // the full arbitration fee. So party A and party B only have a single arbitration fee to split
         // between themselves. We need to figure out how to split up that fee.
         
-        // If A and B have the same resolution, then whichever of them resolved to this value the latest 
-        // should have to pay the full fee (because if they had resolved to it earlier, the arbitrator would
+        // If A and B have a compatible resolution, then whichever of them resolved the latest 
+        // should have to pay the full fee (because if they had resolved earlier, the arbitrator would
         // never have had to be called). See comments for PARTY_A_RESOLVED_LAST
-        if(resolutionsAreEqual(
+        if(resolutionsAreCompatible(
             agreement, agreement.partyAResolutionTokenA, agreement.partyAResolutionTokenB,
-            agreement.partyBResolutionTokenA, agreement.partyBResolutionTokenB)){
+            agreement.partyBResolutionTokenA, agreement.partyBResolutionTokenB, A)){
             if(partyResolvedLast(agreement, party)){
                 return 0;
             }else{
@@ -577,18 +588,18 @@ contract AgreementManagerERC20 is SafeUtils, Arbitrable, EvidenceProducer{
             }
         }
 
-        // Beyond this point we know A and B's resolutions are different. If either of them
-        // agree with the arbiter they should get a refund, leaving the other person with nothing.
+        // Beyond this point we know A and B's resolutions are incompatible. If either of them
+        // are compatible with the arbiter they should get a refund, leaving the other person with nothing.
         (uint resA, uint resB) = partyResolution(agreement, party);
-        if(resolutionsAreEqual(agreement, resA, resB, agreement.resolutionTokenA, agreement.resolutionTokenB)){
+        if(resolutionsAreCompatible(agreement, resA, resB, agreement.resolutionTokenA, agreement.resolutionTokenB, party)){
             return agreement.disputeFee;
         }
         (resA, resB) = partyResolution(agreement, otherParty);
-        if(resolutionsAreEqual(agreement, resA, resB, agreement.resolutionTokenA, agreement.resolutionTokenB)){
+        if(resolutionsAreCompatible(agreement, resA, resB, agreement.resolutionTokenA, agreement.resolutionTokenB, otherParty)){
             return 0;
         }
 
-        // A and B's resolutions are different but unequal to the overall resolution. 
+        // A and B's resolutions are incompatible with each other and with the overall resolution. 
         // Neither party was "right", so they can both split the dispute fee.
         return agreement.disputeFee/2;
     }
@@ -609,15 +620,16 @@ contract AgreementManagerERC20 is SafeUtils, Arbitrable, EvidenceProducer{
             return arbData.weiPaidIn[party];
         }
         
-        // Beyond this point we know the arbitrator has been paid. So party A and party B only have a single arbitration 
+        // Beyond this point we know the arbitrator has been paid (so both paties have resolved).
+        // So party A and party B only have a single arbitration 
         // fee to split between themselves. We need to figure out how to split up that fee.
         
-        // If A and B have the same resolution, then whichever of them resolved to this value the latest 
-        // should have to pay the full fee (because if they had resolved to it earlier, the arbitrator would
+        // If A and B have a compatible resolution, then whichever of them resolved latest 
+        // should have to pay the full fee (because if they had resolved earlier, the arbitrator would
         // never have had to be called). See comments for PARTY_A_RESOLVED_LAST
-        if(resolutionsAreEqual(
+        if(resolutionsAreCompatible(
             agreement, agreement.partyAResolutionTokenA, agreement.partyAResolutionTokenB,
-            agreement.partyBResolutionTokenA, agreement.partyBResolutionTokenB)){
+            agreement.partyBResolutionTokenA, agreement.partyBResolutionTokenB, A)){
             if(partyResolvedLast(agreement, party)){
                 return sub(arbData.weiPaidIn[party], arbData.weiPaidToArbitrator);
             }else{
@@ -625,18 +637,18 @@ contract AgreementManagerERC20 is SafeUtils, Arbitrable, EvidenceProducer{
             }
         }
 
-        // Beyond this point we know A and B's resolutions are different. If either of them
-        // agree with the arbiter they should get a refund, leaving the other person with nothing.
+        // Beyond this point we know A and B's resolutions are incompatible. If either of them
+        // are compatible with the arbiter they should get a refund, leaving the other person with nothing.
         (uint resA, uint resB) = partyResolution(agreement, party);
-        if(resolutionsAreEqual(agreement, resA, resB, agreement.resolutionTokenA, agreement.resolutionTokenB)){
+        if(resolutionsAreCompatible(agreement, resA, resB, agreement.resolutionTokenA, agreement.resolutionTokenB, party)){
             return arbData.weiPaidIn[party]; 
         }
         (resA, resB) = partyResolution(agreement, otherParty);
-        if(resolutionsAreEqual(agreement, resA, resB, agreement.resolutionTokenA, agreement.resolutionTokenB)){
+        if(resolutionsAreCompatible(agreement, resA, resB, agreement.resolutionTokenA, agreement.resolutionTokenB, otherParty)){
             return sub(arbData.weiPaidIn[party], arbData.weiPaidToArbitrator); 
         }
 
-        // A and B's resolutions are different but unequal to the overall resolution. 
+        // A and B's resolutions are incompatible with each other and the overall resolution. 
         // Neither party was "right", so they can both split the dispute fee.
         return sub(arbData.weiPaidIn[party], arbData.weiPaidToArbitrator/2);
     }
@@ -944,10 +956,10 @@ contract AgreementManagerERC20 is SafeUtils, Arbitrable, EvidenceProducer{
 
         (uint otherResA, uint otherResB) = partyResolution(agreement, otherParty);
 
-        // If A and B's resolutions are the same, set the official resolution to this value.
+        // If A and B's resolutions are compatible, set the official resolution to this value.
         // Or set the resolution to the caller's preference if they give all funds to
         // the other person. 
-        if(otherResA != RESOLUTION_NULL && resolutionsAreEqual(agreement, resA, resB, otherResA, otherResB) ||
+        if(otherResA != RESOLUTION_NULL && resolutionsAreCompatible(agreement, resA, resB, otherResA, otherResB, party) ||
             party == A && resA == 0 && resB == 0 ||
             party == B && resA == agreement.partyAStakeAmount && resB == agreement.partyBStakeAmount){
             
@@ -1097,6 +1109,7 @@ contract AgreementManagerERC20 is SafeUtils, Arbitrable, EvidenceProducer{
         }
 
         require(!usingArbitrationStandard(agreement), "Only simple arbitration uses requestArbitration.");
+        require(agreement.arbitratorAddress != address(0), "Arbitration is disallowed.");
         require(!partyResolutionIsNull(agreement, party), "Need to enter a resolution before requesting arbitration.");
         require(!partyRequestedArbitration(agreement, party), "This party already requested arbitration.");
         require(!firstArbitrationRequest || block.timestamp > agreement.nextArbitrationStepAllowedAfterTimestamp, 
@@ -1122,6 +1135,7 @@ contract AgreementManagerERC20 is SafeUtils, Arbitrable, EvidenceProducer{
 
         require(!preventReentrancy(agreement), "Reentrancy protection is on..");
         require(usingArbitrationStandard(agreement), "Only standard arbitration uses requestStandardArbitration.");
+        require(agreement.arbitratorAddress != address(0), "Arbitration is disallowed.");
 
         // Make sure people don't accidentally send ETH when the only required tokens are ERC20
         if(agreement.arbitratorToken != address(0)){
@@ -1180,7 +1194,7 @@ contract AgreementManagerERC20 is SafeUtils, Arbitrable, EvidenceProducer{
 
         require(!usingArbitrationStandard(agreement), "Only simple arbitration uses withdrawDisputeFee.");
         require(partyRequestedArbitration(agreement, A) && partyRequestedArbitration(agreement, B), "Arbitration not requested");
-        require(!partyResolutionsAreEqual(agreement) || partyResolutionIsNull(agreement, A), "Parties already resolved their dispute");
+        require(!partyResolutionsAreCompatible(agreement), "Parties already resolved their dispute");
         require(msg.sender == agreement.arbitratorAddress, "withdrawDisputeFee can only be called by Arbitrator.");
         require(!arbitratorWithdrewDisputeFee(agreement), "Already withdrew dispute fee.");
 
