@@ -1,22 +1,22 @@
-pragma solidity 0.5.3;
+pragma solidity 0.5.7;
 
-contract SafeUtils{
-    function toUint48(uint val) internal pure returns (uint48){
+contract SafeUtils {
+    function toUint48(uint val) internal pure returns (uint48) {
         uint48 ret = uint48(val);
         require(ret == val, "toUint48 lost some value.");
         return ret;
     }
-    function toUint32(uint val) internal pure returns (uint32){
+    function toUint32(uint val) internal pure returns (uint32) {
         uint32 ret = uint32(val);
         require(ret == val, "toUint32 lost some value.");
         return ret;
     }
-    function toUint16(uint val) internal pure returns (uint16){
+    function toUint16(uint val) internal pure returns (uint16) {
         uint16 ret = uint16(val);
         require(ret == val, "toUint16 lost some value.");
         return ret;
     }
-    function toUint8(uint val) internal pure returns (uint8){
+    function toUint8(uint val) internal pure returns (uint8) {
         uint8 ret = uint8(val);
         require(ret == val, "toUint8 lost some value.");
         return ret;
