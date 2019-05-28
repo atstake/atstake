@@ -1,4 +1,4 @@
-pragma solidity 0.5.7;
+pragma solidity 0.5.8;
 
 import "./AgreementManagerETH.sol";
 import "./SimpleArbitrationInterface.sol";
@@ -7,9 +7,9 @@ import "./SimpleArbitrationInterface.sol";
     @notice
     See AgreementManager for comments on the overall nature of this contract.
 
-    This is the contract defining how ETH-only agreements with simple (non-ERC792) 
+    This is the contract defining how ETH-only agreements with simple (non-ERC792)
     arbitration work.
-    
+
     @dev
     The relevant part of the inheritance tree is:
     AgreementManager
@@ -38,11 +38,11 @@ contract AgreementManagerETH_Simple is AgreementManagerETH, SimpleArbitrationInt
     /// Return value interpretation is self explanatory if you look at the code
     function getState(
         uint agreementID
-    ) 
-        external 
-        view 
-        returns (address[3] memory, uint[16] memory, bool[11] memory, bytes memory) 
-    { 
+    )
+        external
+        view
+        returns (address[3] memory, uint[16] memory, bool[11] memory, bytes memory)
+    {
         if (agreementID >= agreements.length) {
             address[3] memory zeroAddrs;
             uint[16] memory zeroUints;
@@ -50,12 +50,12 @@ contract AgreementManagerETH_Simple is AgreementManagerETH, SimpleArbitrationInt
             bytes memory zeroBytes;
             return (zeroAddrs, zeroUints, zeroBools, zeroBytes);
         }
-        
+
         AgreementDataETH storage agreement = agreements[agreementID];
 
         address[3] memory addrs = [
-            agreement.partyAAddress, 
-            agreement.partyBAddress, 
+            agreement.partyAAddress,
+            agreement.partyBAddress,
             agreement.arbitratorAddress
         ];
         uint[16] memory uints = [
@@ -71,7 +71,7 @@ contract AgreementManagerETH_Simple is AgreementManagerETH, SimpleArbitrationInt
             agreement.nextArbitrationStepAllowedAfterTimestamp,
             agreement.autoResolveAfterTimestamp,
             agreement.daysToRespondToArbitrationRequest,
-            // Return a bunch of zeroes where the ERC792 arbitration data is so we can have the 
+            // Return a bunch of zeroes where the ERC792 arbitration data is so we can have the
             // same API for all contracts.
             0,
             0,
@@ -83,8 +83,8 @@ contract AgreementManagerETH_Simple is AgreementManagerETH, SimpleArbitrationInt
             partyStakePaid(agreement, Party.B),
             partyRequestedArbitration(agreement, Party.A),
             partyRequestedArbitration(agreement, Party.B),
-            partyWithdrew(agreement, Party.A),
-            partyWithdrew(agreement, Party.B),
+            partyReceivedDistribution(agreement, Party.A),
+            partyReceivedDistribution(agreement, Party.B),
             partyAResolvedLast(agreement),
             arbitratorResolved(agreement),
             arbitratorWithdrewDisputeFee(agreement),
@@ -94,8 +94,8 @@ contract AgreementManagerETH_Simple is AgreementManagerETH, SimpleArbitrationInt
             false
         ];
         // Return empty bytes value to keep the same API as for the ERC792 version
-        bytes memory bytesVal; 
-        
+        bytes memory bytesVal;
+
         return (addrs, uints, boolVals, bytesVal);
     }
 
@@ -103,11 +103,18 @@ contract AgreementManagerETH_Simple is AgreementManagerETH, SimpleArbitrationInt
     // -------------------- main external functions that affect state ----------------------------
     // -------------------------------------------------------------------------------------------
 
-    /// @notice Called by arbitrator to report their resolution. 
+    /// @notice Called by arbitrator to report their resolution.
     /// Can only be called after arbitrator is asked to arbitrate by both parties.
     /// @param resolutionWei The amount of wei that the caller thinks should go to party A.
     /// The remaining amount of wei staked for this agreement would go to party B.
-    function resolveAsArbitrator(uint agreementID, uint resolutionWei) external {
+    /// @param distributeFunds Whether to distribute funds to both parties
+    function resolveAsArbitrator(
+        uint agreementID,
+        uint resolutionWei,
+        bool distributeFunds
+    )
+        external
+    {
         AgreementDataETH storage agreement = agreements[agreementID];
 
         require(agreementIsOpen(agreement), "Agreement not open.");
@@ -116,18 +123,18 @@ contract AgreementManagerETH_Simple is AgreementManagerETH, SimpleArbitrationInt
         uint48 res = toMillionth(resolutionWei);
 
         require(
-            msg.sender == agreement.arbitratorAddress, 
+            msg.sender == agreement.arbitratorAddress,
             "resolveAsArbitrator can only be called by arbitrator."
         );
         require(
-            res <= add(agreement.partyAStakeAmount, agreement.partyBStakeAmount), 
+            res <= add(agreement.partyAStakeAmount, agreement.partyBStakeAmount),
             "Resolution out of range."
         );
         require(
             (
-                partyRequestedArbitration(agreement, Party.A) && 
+                partyRequestedArbitration(agreement, Party.A) &&
                 partyRequestedArbitration(agreement, Party.B)
-            ), 
+            ),
             "Arbitration not requested by both parties."
         );
 
@@ -135,14 +142,14 @@ contract AgreementManagerETH_Simple is AgreementManagerETH, SimpleArbitrationInt
 
         emit ArbitratorResolved(uint32(agreementID), resolutionWei);
 
-        agreement.resolution = res;
+        finalizeResolution(agreementID, agreement, res, distributeFunds);
     }
 
     /// @notice Request that the arbitrator get involved to settle the disagreement.
     /// Each party needs to pay the full arbitration fee when calling this. However they will be
     /// refunded the full fee if the arbitrator agrees with them.
     /// If one party calls this and the other refuses to, the party who called this function can
-    /// eventually call requestDefaultJudgment. 
+    /// eventually call requestDefaultJudgment.
     function requestArbitration(uint agreementID) external payable {
         AgreementDataETH storage agreement = agreements[agreementID];
 
@@ -153,45 +160,38 @@ contract AgreementManagerETH_Simple is AgreementManagerETH, SimpleArbitrationInt
 
         Party callingParty = getCallingParty(agreement);
         require(
-            RESOLUTION_NULL != partyResolution(agreement, callingParty), 
+            RESOLUTION_NULL != partyResolution(agreement, callingParty),
             "Need to enter a resolution before requesting arbitration."
         );
         require(
-            !partyRequestedArbitration(agreement, callingParty), 
+            !partyRequestedArbitration(agreement, callingParty),
             "This party already requested arbitration."
         );
 
-        bool firstArbitrationRequest = 
-            !partyRequestedArbitration(agreement, Party.A) && 
+        bool firstArbitrationRequest =
+            !partyRequestedArbitration(agreement, Party.A) &&
             !partyRequestedArbitration(agreement, Party.B);
-            
+
         require(
             (
-                !firstArbitrationRequest || 
+                !firstArbitrationRequest ||
                 block.timestamp > agreement.nextArbitrationStepAllowedAfterTimestamp
-            ), 
+            ),
             "Arbitration not allowed yet."
         );
 
         setPartyRequestedArbitration(agreement, callingParty, true);
 
         emit ArbitrationRequested(uint32(agreementID));
-    
+
         if (firstArbitrationRequest) {
-            // update the deadline for the other party to pay
-            agreement.nextArbitrationStepAllowedAfterTimestamp = 
-                toUint32(
-                    add(
-                        block.timestamp, 
-                        mul(agreement.daysToRespondToArbitrationRequest, (1 days))
-                    )
-                );
+            updateArbitrationResponseDeadline(agreement);
         } else {
             // Both parties have requested arbitration. Emit this event to conform to ERC1497.
             emit Dispute(
-                Arbitrator(agreement.arbitratorAddress), 
-                agreementID, 
-                agreementID, 
+                Arbitrator(agreement.arbitratorAddress),
+                agreementID,
+                agreementID,
                 agreementID
             );
         }
@@ -199,26 +199,27 @@ contract AgreementManagerETH_Simple is AgreementManagerETH, SimpleArbitrationInt
 
     /// @notice Allow the arbitrator to indicate they're working on the dispute by withdrawing the
     /// funds. We can't prevent dishonest arbitrator from taking funds without doing work, because
-    /// they can always call 'rule' quickly. So just avoid the case where we send funds to a
-    /// nonresponsive arbitrator.
+    /// they can always call 'resolveAsArbitrator' quickly. So we prevent the arbitrator from
+    /// actually being paid until they either call this function or 'resolveAsArbitrator' to avoid
+    /// the case where we send funds to a nonresponsive arbitrator.
     function withdrawDisputeFee(uint agreementID) external {
         AgreementDataETH storage agreement = agreements[agreementID];
 
         require(
             (
-                partyRequestedArbitration(agreement, Party.A) && 
+                partyRequestedArbitration(agreement, Party.A) &&
                 partyRequestedArbitration(agreement, Party.B)
-            ), 
+            ),
             "Arbitration not requested"
         );
         require(
-            msg.sender == agreement.arbitratorAddress, 
+            msg.sender == agreement.arbitratorAddress,
             "withdrawDisputeFee can only be called by Arbitrator."
         );
         require(
             !resolutionsAreCompatibleBothExist(
-                agreement.partyAResolution, 
-                agreement.partyBResolution, 
+                agreement.partyAResolution,
+                agreement.partyBResolution,
                 Party.A
             ),
             "partyA and partyB already resolved their dispute."
@@ -237,107 +238,76 @@ contract AgreementManagerETH_Simple is AgreementManagerETH, SimpleArbitrationInt
     // -------------------------------------------------------------------------------------------
 
     /// @dev This function is NOT untrusted in this contract.
-    /// @return whether the given party has paid the arbitration fee in full. 
+    /// @return whether the given party has paid the arbitration fee in full.
     function partyFullyPaidDisputeFee_SometimesUntrusted(
-        uint, /*agreementID is unused in this version*/ 
-        AgreementDataETH storage agreement, 
+        uint, /*agreementID is unused in this version*/
+        AgreementDataETH storage agreement,
         Party party) internal returns (bool) {
-            
+
         // Since the arbitration fee can't change mid-agreement in simple arbitration,
         // having requested arbitration means the dispute fee is paid.
-        return partyRequestedArbitration(agreement, party);     
+        return partyRequestedArbitration(agreement, party);
+    }
+
+    /// @return Whether the party provided is closer to winning a default judgment than the other
+    /// party. For simple arbitration this means just that they'd paid the arbitration fee
+    /// and the other party hasn't.
+    function partyIsCloserToWinningDefaultJudgment(
+        uint /*agreementID*/,
+        AgreementDataETH storage agreement,
+        Party party
+    )
+        internal
+        returns (bool)
+    {
+        return partyRequestedArbitration(agreement, party) &&
+            !partyRequestedArbitration(agreement, getOtherParty(party));
     }
 
 
-    /// @notice See comments in AgreementManagerETH to understand the goal of this complex and 
+    /// @notice See comments in AgreementManagerETH to understand the goal of this
     /// important function.
     /// @dev We don't use the first argument (agreementID) in this version, but it's there because
     /// we use inheritance.
     function getPartyArbitrationRefundInWei(
-        uint, 
-        AgreementDataETH storage agreement, 
+        uint /*agreementID*/,
+        AgreementDataETH storage agreement,
         Party party
-    ) 
-        internal 
-        view 
-        returns (uint) 
+    )
+        internal
+        view
+        returns (uint)
     {
-        Party otherParty = getOtherParty(party);
-
-        // If the calling party never requested arbitration then they never paid in an arbitration 
-        // fee, so they should never get an arbitration refund.
         if (!partyRequestedArbitration(agreement, party)) {
+            // party didn't pay an arbitration fee, so gets no refund.
             return 0;
         }
 
-        // Beyond this point, we know the caller requested arbitration and paid an arbitration fee
-        // (if disputeFee was nonzero).
+        // Now we know party paid an arbitration fee, so figure out how much of it they get back.
 
-        // If the other party didn't request arbitration, then the arbitrator couldn't have been 
-        // paid because the arbitrator is only paid when both parties have paid the full 
-        // arbitration fee. So in that case the calling party is entitled to a full refund of what
-        // they paid in.
-        if (!partyRequestedArbitration(agreement, otherParty)) {
-            return toWei(agreement.disputeFee);
-        }
-
-        // Beyond this point we know that both parties paid the full arbitration fee.
-        // This implies they've also both resolved.
-
-        // If the arbitrator didn't resolve or withdraw, that means they weren't paid. 
-        // And they can never be paid, because we'll only call this function after a final 
-        // resolution has been determined. So we should get our fee back.
-        if (!arbitratorResolved(agreement) && !arbitratorWithdrewDisputeFee(agreement)) {
-            return toWei(agreement.disputeFee);
-        }
-
-        // Beyond this point, we know the arbitrator either was already paid or is entitled to 
-        // withdraw the full arbitration fee. So party A and party B only have a single 
-        // arbitration fee to split between themselves. We need to figure out how to split up 
-        // that fee.
-        
-        // If A and B have compatible resolutions, then whichever of them resolved latest 
-        // should have to pay the full fee (because if they had resolved earlier, the arbitrator 
-        // would never have had to be called). See comments for PARTY_A_RESOLVED_LAST.
-
-        if (
-            resolutionsAreCompatibleBothExist(
-                agreement.partyAResolution, 
-                agreement.partyBResolution, 
-                Party.A
-            )
-        ) { 
-            if (partyResolvedLast(agreement, party)) {
-                return 0;
-            } else {
-                return toWei(agreement.disputeFee); 
+        if (partyDisputeFeeLiability(agreement, party)) {
+            // party has liability for the dispute fee. The only question is whether they
+            // pay the full amount or half.
+            Party otherParty = getOtherParty(party);
+            if (partyDisputeFeeLiability(agreement, otherParty)) {
+                // party pays half the fee
+                return toWei(agreement.disputeFee/2);
             }
+            return 0; // pays the full fee
         }
+        // No liability -- full refund
+        return toWei(agreement.disputeFee);
+    }
 
-        // Beyond this point we know A and B's resolutions are incompatible. If either of them
-        // agree with the arbiter they should get a refund, leaving the other person with nothing.
-        if (
-            resolutionsAreCompatibleBothExist(
-                partyResolution(agreement, party), 
-                agreement.resolution, 
-                party
-            )
-        ) {
-            return toWei(agreement.disputeFee);
-        }
-
-        if (
-            resolutionsAreCompatibleBothExist(
-                partyResolution(agreement, otherParty), 
-                agreement.resolution, 
-                otherParty
-            )
-        ) {
-            return 0;
-        }
-
-        // A and B's resolutions are different but both incompatible with the overall resolution. 
-        // Neither party was "right", so they can both split the dispute fee.
-        return toWei(agreement.disputeFee/2);
+    /// @return whether the arbitrator has either already received or is entitled to withdraw
+    /// the dispute fee
+    function arbitratorGetsDisputeFee(
+        uint /*agreementID*/,
+        AgreementDataETH storage agreement
+    )
+        internal
+        returns (bool)
+    {
+        return arbitratorResolved(agreement) || arbitratorWithdrewDisputeFee(agreement);
     }
 }

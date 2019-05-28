@@ -1,8 +1,8 @@
-pragma solidity 0.5.3;
+pragma solidity 0.5.8;
 
 import "./Arbitrator.sol";
 
-contract Arbitrable{
+contract Arbitrable {
 
     function rule(uint _dispute, uint _ruling) public;
 

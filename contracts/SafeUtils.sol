@@ -1,4 +1,4 @@
-pragma solidity 0.5.7;
+pragma solidity 0.5.8;
 
 contract SafeUtils {
     function toUint48(uint val) internal pure returns (uint48) {

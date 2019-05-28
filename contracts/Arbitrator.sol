@@ -1,4 +1,4 @@
-pragma solidity 0.5.3;
+pragma solidity 0.5.8;
 
 import "./Arbitrable.sol";
 
@@ -11,7 +11,7 @@ import "./Arbitrable.sol";
  */
 contract Arbitrator {
 
-    enum DisputeStatus {Waiting, Appealable, Solved}
+    enum DisputeStatus { Waiting, Appealable, Solved }
 
     /** @dev To be raised when a dispute is created.
      *  @param _disputeID ID of the dispute.

@@ -1,4 +1,4 @@
-pragma solidity 0.5.7;
+pragma solidity 0.5.8;
 
 contract ERC20Interface {
     function totalSupply() public view returns (uint);
