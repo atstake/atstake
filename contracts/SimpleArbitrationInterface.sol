@@ -1,4 +1,4 @@
-pragma solidity 0.5.8;
+pragma solidity 0.5.3;
 
 /**
     @notice A contract that AgreementManagers that implement simple (non-ERC792) arbitration can
