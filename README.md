@@ -1,6 +1,8 @@
-# atstake
+# Ethereum contracts used by Atstake
 
-All the solidity contracts used by Atstake are in the 'contracts' directory. Read the comments at the top of AgreementManager.sol for an overview of all contracts.
+This repository contains all of the Ethereum contracts used by Atstake. We encourage our users to carefully review these contracts to gain confidence in the security of your agreements.
+
+All the solidity contracts are in the 'contracts' directory. Read the comments at the top of AgreementManager.sol for an overview of all contracts.
 
 Agreements that use only ETH are managed by AgreementManagerETH_Simple.sol. Its deployed address is 0x6FDE4cd3c359a5aCedce58D01eDF2dB26eDB44ff.
 
@@ -13,6 +15,7 @@ To verify that the code in this repository matches the contract deployed on the 
 1. Verify that the code in this github repository matches the code on Etherscan.
 
 Alternatively if you don't want to trust Etherscan you can use any other block explorer to get the bytecode of the contracts, then compile the code in this repository with the following options and verify that the bytecodes match:
+* Solidity version 0.5.3
 * Optimization on
 * 1000 runs
 * targeting the Byzantium EVM
