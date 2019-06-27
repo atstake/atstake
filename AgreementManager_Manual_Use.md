@@ -1,4 +1,6 @@
-If the Atstake website is ever offline, you can use the following instructions to continue interacting with the AgreementManager contracts.
+# Interacting with your agreements without the Atstake site
+
+If the Atstake website is ever offline, you can use the following instructions to continue interacting with the AgreementManager contracts. You may want to store a private copy of these instructions in case this repo ever becomes unavailable.
 
 **(1) Determine whether you're using the AgreementManagerETH_Simple or AgreementManagerERC20_Simple contract**
 
