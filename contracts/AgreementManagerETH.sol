@@ -112,7 +112,7 @@ contract AgreementManagerETH is AgreementManager {
     )
         external
         view
-        returns (address[3] memory, uint[16] memory, bool[11] memory, bytes memory);
+        returns (address[3] memory, uint[16] memory, bool[12] memory, bytes memory);
 
     // -------------------------------------------------------------------------------------------
     // -------------------- main external functions that affect state ----------------------------
@@ -142,7 +142,6 @@ contract AgreementManagerETH is AgreementManager {
     quantities[7]: 32 bit timestamp value before which arbitration can't be requested.
     quantities[8]: 32 bit timestamp value after which auto-resolution is allowed if no one
                    requested arbitration. 0 means never.
-    param inputFlags is currently unused
     @param arbExtraData Data to pass in to ERC792 arbitrator if a dispute is ever created. Use
     null when creating non-ERC792 agreements
     @return the agreement id of the newly added agreement*/
@@ -151,7 +150,6 @@ contract AgreementManagerETH is AgreementManager {
         string calldata agreementURI,
         address[3] calldata participants,
         uint[9] calldata quantities,
-        uint /*inputFlags*/,
         bytes calldata arbExtraData
     )
         external
@@ -161,8 +159,16 @@ contract AgreementManagerETH is AgreementManager {
         require(msg.sender == participants[0], "Only party A can call createAgreementA.");
         require(msg.value == add(quantities[0], quantities[2]), "Payment not correct.");
         require(
-            quantities[5] <= add(quantities[0], quantities[1]),
-            "Automatic resolution was too large."
+            (
+                participants[0] != participants[1] &&
+                participants[0] != participants[2] &&
+                participants[1] != participants[2]
+            ),
+            "partyA, partyB, and arbitrator addresses must be unique."
+        );
+        require(
+            quantities[6] >= 1 && quantities[6] <= MAX_DAYS_TO_RESPOND_TO_ARBITRATION_REQUEST,
+            "Days to respond to arbitration was out of range."
         );
 
         // Populate a AgreementDataETH struct with the info provided.
@@ -175,10 +181,13 @@ contract AgreementManagerETH is AgreementManager {
         agreement.resolution = RESOLUTION_NULL;
         agreement.partyAStakeAmount = toMillionth(quantities[0]);
         agreement.partyBStakeAmount = toMillionth(quantities[1]);
+        uint sumOfStakes = add(agreement.partyAStakeAmount, agreement.partyBStakeAmount);
+        require(sumOfStakes < RESOLUTION_NULL, "Stake amounts were too large.");
         agreement.partyAInitialArbitratorFee = toMillionth(quantities[2]);
         agreement.partyBInitialArbitratorFee = toMillionth(quantities[3]);
         agreement.disputeFee = toMillionth(quantities[4]);
         agreement.automaticResolution = toMillionth(quantities[5]);
+        require(agreement.automaticResolution <= sumOfStakes, "Automatic resolution too large.");
         agreement.daysToRespondToArbitrationRequest = toUint16(quantities[6]);
         agreement.nextArbitrationStepAllowedAfterTimestamp = toUint32(quantities[7]);
         agreement.autoResolveAfterTimestamp = toUint32(quantities[8]);
@@ -200,7 +209,7 @@ contract AgreementManagerETH is AgreementManager {
         // Pay the arbitrator if needed, which happens if B was staking no funds and needed no
         // initial fee, but there was an initial fee from A.
         if ((add(quantities[1], quantities[3]) == 0) && (quantities[2] > 0)) {
-            payOutInitialArbitratorFee_Untrusted(agreementID);
+            payOutInitialArbitratorFee_Untrusted_Unguarded(agreementID);
         }
         return agreementID;
     }
@@ -229,7 +238,7 @@ contract AgreementManagerETH is AgreementManager {
         emit PartyBDeposited(uint32(agreementID));
 
         if (add(agreement.partyAInitialArbitratorFee, agreement.partyBInitialArbitratorFee) > 0) {
-            payOutInitialArbitratorFee_Untrusted(agreementID);
+            payOutInitialArbitratorFee_Untrusted_Unguarded(agreementID);
         }
     }
 
@@ -270,6 +279,9 @@ contract AgreementManagerETH is AgreementManager {
         if (partyIsCloserToWinningDefaultJudgment(agreementID, agreement, callingParty)) {
             // If new resolution isn't compatible with the existing one, then the caller
             // made the resolution more favorable to themself.
+            // We know that an old resolution exists because for the caller to be closer to
+            // winning a default judgment they must have requested arbitration, and they can only
+            // request arbitration after resolving.
             if (
                 !resolutionsAreCompatibleBothExist(
                     res,
@@ -289,7 +301,13 @@ contract AgreementManagerETH is AgreementManager {
         // final resolution.
         uint otherRes = partyResolution(agreement, otherParty);
         if (resolutionsAreCompatible(agreement, res, otherRes, callingParty)) {
-            finalizeResolution(agreementID, agreement, res, distributeFunds);
+            finalizeResolution_Untrusted_Unguarded(
+                agreementID,
+                agreement,
+                res,
+                distributeFunds,
+                false
+            );
         }
     }
 
@@ -321,19 +339,22 @@ contract AgreementManagerETH is AgreementManager {
     /// Each party calls this to withdraw the funds they're entitled to, based on the resolution.
     /// Normally funds are distributed automatically when the agreement gets resolved. However
     /// it is possible for a malicious user to prevent their counterparty from getting an
-    /// automatic distribution, by using an address for the agreement that can't recieve payments.
+    /// automatic distribution, by using an address for the agreement that can't receive payments.
     /// If this happens, the agreement should be resolved by setting the distributeFunds parameter
     /// to false in whichever function is called to resolve the disagreement. Then the parties can
     /// independently extract their funds via this function.
     function withdraw(uint agreementID) external {
         AgreementDataETH storage agreement = agreements[agreementID];
         require(!pendingExternalCall(agreement), "Reentrancy protection is on");
-
-        Party callingParty = getCallingParty(agreement);
+        require(agreement.resolution != RESOLUTION_NULL, "Agreement is not resolved.");
 
         emit PartyWithdrew(uint32(agreementID));
 
-        distributeFundsHelper(agreementID, agreement, callingParty);
+        distributeFundsToPartyHelper_Untrusted_Unguarded(
+            agreementID,
+            agreement,
+            getCallingParty(agreement)
+        );
     }
 
     /// @notice Request that the arbitrator get involved to settle the disagreement.
@@ -366,19 +387,28 @@ contract AgreementManagerETH is AgreementManager {
         emit DefaultJudgment(uint32(agreementID));
 
         require(
-            partyFullyPaidDisputeFee_SometimesUntrusted(agreementID, agreement, callingParty),
+            partyFullyPaidDisputeFee_Sometimes_Untrusted_Guarded(
+                agreementID,
+                agreement,
+                callingParty
+            ),
             "Party didn't fully pay the dispute fee."
         );
         require(
-            !partyFullyPaidDisputeFee_SometimesUntrusted(agreementID, agreement, otherParty),
+            !partyFullyPaidDisputeFee_Sometimes_Untrusted_Guarded(
+                agreementID,
+                agreement,
+                otherParty
+            ),
             "Other party fully paid the dispute fee."
         );
 
-        finalizeResolution(
+        finalizeResolution_Untrusted_Unguarded(
             agreementID,
             agreement,
             partyResolution(agreement, callingParty),
-            distributeFunds
+            distributeFunds,
+            false
         );
     }
 
@@ -413,11 +443,12 @@ contract AgreementManagerETH is AgreementManager {
 
         emit AutomaticResolution(uint32(agreementID));
 
-         finalizeResolution(
+         finalizeResolution_Untrusted_Unguarded(
             agreementID,
             agreement,
             agreement.automaticResolution,
-            distributeFunds
+            distributeFunds,
+            false
         );
     }
 
@@ -521,14 +552,14 @@ contract AgreementManagerETH is AgreementManager {
         return getBool(agreement.boolValues, ARBITRATOR_RESOLVED);
     }
 
-    function arbitratorWithdrewDisputeFee(
+    function arbitratorReceivedDisputeFee(
         AgreementDataETH storage agreement
     )
         internal
         view
         returns (bool)
     {
-        return getBool(agreement.boolValues, ARBITRATOR_WITHDREW_DISPUTE_FEE);
+        return getBool(agreement.boolValues, ARBITRATOR_RECEIVED_DISPUTE_FEE);
     }
 
     function partyDisputeFeeLiability(
@@ -631,7 +662,7 @@ contract AgreementManagerETH is AgreementManager {
         agreement.boolValues = setBool(agreement.boolValues, ARBITRATOR_RESOLVED, value);
     }
 
-    function setArbitratorWithdrewDisputeFee(
+    function setArbitratorReceivedDisputeFee(
         AgreementDataETH storage agreement,
         bool value
     )
@@ -639,7 +670,7 @@ contract AgreementManagerETH is AgreementManager {
     {
         agreement.boolValues = setBool(
             agreement.boolValues,
-            ARBITRATOR_WITHDREW_DISPUTE_FEE,
+            ARBITRATOR_RECEIVED_DISPUTE_FEE,
             value
         );
     }
@@ -668,6 +699,19 @@ contract AgreementManagerETH is AgreementManager {
 
     function setPendingExternalCall(AgreementDataETH storage agreement, bool value) internal {
         agreement.boolValues = setBool(agreement.boolValues, PENDING_EXTERNAL_CALL, value);
+    }
+
+    /// @notice set the value of PENDING_EXTERNAL_CALL and return the previous value.
+    function getThenSetPendingExternalCall(
+        AgreementDataETH storage agreement,
+        bool value
+    )
+        internal
+        returns (bool)
+    {
+        uint32 previousBools = agreement.boolValues;
+        agreement.boolValues = setBool(previousBools, PENDING_EXTERNAL_CALL, value);
+        return getBool(previousBools, PENDING_EXTERNAL_CALL);
     }
 
     // -------------------------------------------------------------------------------------------
@@ -737,23 +781,6 @@ contract AgreementManagerETH is AgreementManager {
                 false,
                 "getCallingPartyAndOtherParty must be called by a party to the agreement."
             );
-        }
-    }
-
-    /// @notice Assumes that at least one person has resolved.
-    /// @return whether the given party was the last to submit a resolution.
-    function partyResolvedLast(
-        AgreementDataETH storage agreement,
-        Party party
-    )
-        internal
-        view
-        returns (bool)
-    {
-        if (partyAResolvedLast(agreement)) {
-            return party == Party.A;
-        } else {
-            return party == Party.B;
         }
     }
 
@@ -857,9 +884,10 @@ contract AgreementManagerETH is AgreementManager {
     /// when creating an ERC792 agreement.
     function storeArbitrationExtraData(uint agreementID, bytes memory arbExtraData) internal;
 
-    /// @dev 'SometimesUntrusted' means that in some inheriting contracts it's untrusted, in some
-    /// not. Look at the implementation in the contract you're interested in to know which it is.
-    function partyFullyPaidDisputeFee_SometimesUntrusted(
+    /// @dev '_Sometimes_Untrusted_Guarded' means that in some inheriting contracts it's
+    /// _Untrusted_Guarded, in some it isn't. Look at the implementation in the specific
+    /// contract you're interested in to know.
+    function partyFullyPaidDisputeFee_Sometimes_Untrusted_Guarded(
         uint agreementID,
         AgreementDataETH storage agreement,
         Party party
@@ -892,7 +920,7 @@ contract AgreementManagerETH is AgreementManager {
     /// @notice When both parties have deposited their stakes, the arbitrator is paid any
     /// 'initial' arbitration fee that was required. We assume we've already checked that the
     /// arbitrator is owed a nonzero amount.
-    function payOutInitialArbitratorFee_Untrusted(uint agreementID) internal {
+    function payOutInitialArbitratorFee_Untrusted_Unguarded(uint agreementID) internal {
         AgreementDataETH storage agreement = agreements[agreementID];
 
         uint totalInitialFeesWei = toWei(
@@ -915,37 +943,45 @@ contract AgreementManagerETH is AgreementManager {
     }
 
     /// @notice A helper function that sets the final resolution for the agreement, and
-    /// also distributes funds to the participants if 'distribute' is true.
-    function finalizeResolution(
+    /// also distributes funds to the participants based on distributeFundsToParties and
+    /// distributeFundsToArbitrator.
+    function finalizeResolution_Untrusted_Unguarded(
         uint agreementID,
         AgreementDataETH storage agreement,
         uint48 res,
-        bool distributeFunds
+        bool distributeFundsToParties,
+        bool distributeFundsToArbitrator
     )
         internal
     {
         agreement.resolution = res;
         calculateDisputeFeeLiability(agreementID, agreement);
-        if (distributeFunds) {
+        if (distributeFundsToParties) {
             emit FundsDistributed(uint32(agreementID));
-            distributeFundsHelper(agreementID, agreement, Party.A);
-            distributeFundsHelper(agreementID, agreement, Party.B);
+            // These calls are not "Reentrancy Safe" (see AgreementManager.sol comments).
+            // Using reentrancy guard.
+            bool previousValue = getThenSetPendingExternalCall(agreement, true);
+            distributeFundsToPartyHelper_Untrusted_Unguarded(agreementID, agreement, Party.A);
+            distributeFundsToPartyHelper_Untrusted_Unguarded(agreementID, agreement, Party.B);
+            setPendingExternalCall(agreement, previousValue);
+        }
+        if (distributeFundsToArbitrator) {
+            distributeFundsToArbitratorHelper_Untrusted_Unguarded(agreementID, agreement);
         }
     }
 
     /// @notice This can only be called after a resolution is established.
     /// A helper function to distribute funds owed to a party based on the resolution and any
     /// arbitration fee refund they're owed.
-    function distributeFundsHelper(
+    /// Assumes that a resolution exists.
+    function distributeFundsToPartyHelper_Untrusted_Unguarded(
         uint agreementID,
         AgreementDataETH storage agreement,
         Party party
     )
         internal
     {
-        require(agreement.resolution != RESOLUTION_NULL, "Agreement is not resolved.");
-        require(!partyReceivedDistribution(agreement, party), "Party already received funds.");
-
+        require(!partyReceivedDistribution(agreement, party), "party already received funds.");
         setPartyReceivedDistribution(agreement, party, true);
 
         uint distributionAmount = 0;
@@ -966,6 +1002,25 @@ contract AgreementManagerETH is AgreementManager {
         if (distributionWei > 0) {
             // Need to do this conversion to make the address payable
             address(uint160(partyAddress(agreement, party))).transfer(distributionWei);
+        }
+    }
+
+    /// @notice A helper function to distribute funds owed to the arbitrator. These funds can be
+    /// distributed either when the arbitrator calls withdrawDisputeFee or resolveAsArbitrator.
+    function distributeFundsToArbitratorHelper_Untrusted_Unguarded(
+        uint agreementID,
+        AgreementDataETH storage agreement
+    )
+        internal
+    {
+        require(!arbitratorReceivedDisputeFee(agreement), "Already received dispute fee.");
+        setArbitratorReceivedDisputeFee(agreement, true);
+
+        emit ArbitratorReceivedDisputeFee(uint32(agreementID));
+
+        uint feeAmount = agreement.disputeFee;
+        if (feeAmount > 0) {
+            address(uint160(agreement.arbitratorAddress)).transfer(toWei(feeAmount));
         }
     }
 

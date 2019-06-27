@@ -17,15 +17,8 @@ import "./ERC20Interface.sol";
             AgreementManagerERC20_Simple
             AgreementManagerERC20_ERC792
 
-    Notes on reentrancy: The functions that call ERC20 contracts are safe, because the calls
-    that wrap ERC20 tranfers (executeDistribution_Untrusted, payOutInitialArbitratorFee_Untrusted,
-    sendFunds_Untrusted) are always called at the end of their respective functions, after all
-    internal state has been updated. Therefore, we don't wrap them in a reentrancy guard.
-
-    For ease of review, functions that call untrusted external functions (even via multiple calls)
-    will have "_Untrusted" appended to the function name, except if that function is directly
-    callable by an external party. One function has "_SometimesUntrusted" appended to its name, as
-    its untrusted in some inheriting functions.
+    Search that file for "NOTES ON REENTRANCY" to learn more about our reentrancy protection
+    strategy.
 */
 
 contract AgreementManagerERC20 is AgreementManager {
@@ -33,14 +26,19 @@ contract AgreementManagerERC20 is AgreementManager {
     // --------------------------------- special values ------------------------------------------
     // -------------------------------------------------------------------------------------------
 
-
-    // We store ETH/token amounts internally uint48s. The amount that we store internally is
-    // multipled by 10^TOKENPOWER, where TOKENPOWER is passed into the contract for each ERC20
-    // token that the contract needs to represent.
-    // The constant MAX_TOKEN_POWER is used to check that these passed in values aren't too big.
-    // We 'll never need to multiply our 48 bit values by more than 10^64 since 2^48 is about
-    // 3 * 10^14, and 2^256 (the amount a uint can represent) = 1.2 * 10^77 and 64 + 14 > 77
-    uint constant MAX_TOKEN_POWER = 64;
+    /**
+    We store ETH/token amounts internally uint48s. The amount that we store internally is
+    multipled by 10^TOKENPOWER, where TOKENPOWER is passed into the contract for each ERC20 token
+    that the contract needs to represent. The constant MAX_TOKEN_POWER is used to check that these
+    passed in values aren't too big. A token power of 50 can represent
+    2^48 * 10^50 ~= 2.8 * 10^64 (since 2^48 ~= 2.8 * 10^14) of a token's equivalent of wei.
+    There are 10^18 wei in an ETH, so if the token were ETH this could represent about
+    10^46 ETH. Note that 2^256 is about 10^77, so we're unable to represent extremely high
+    amounts of tokens with this scheme, but in practice we don't expect this to be an issue.
+    Using MAX_TOKEN_POWER keeps our exponentiation from overflowing, since even
+    if we add a bunch of 48 bit resolutions together before multiplying by 10^50 the result will
+    be far less than 10^77.*/
+    uint constant MAX_TOKEN_POWER = 50;
 
     // -------------------------------------------------------------------------------------------
     // ------------------------------------- events ----------------------------------------------
@@ -163,7 +161,7 @@ contract AgreementManagerERC20 is AgreementManager {
     )
         external
         view
-        returns (address[6] memory, uint[23] memory, bool[11] memory, bytes memory);
+        returns (address[6] memory, uint[23] memory, bool[12] memory, bytes memory);
 
     // -------------------------------------------------------------------------------------------
     // -------------------- main external functions that affect state ----------------------------
@@ -206,7 +204,6 @@ contract AgreementManagerERC20 is AgreementManager {
                     units of 10^^value
     quantities[12]: value such that all amounts of arbitrator's preferred token type are
                     internally in units of 10^^value
-    param inputFlags is currently unused
     @param arbExtraData Data to pass in to ERC792 arbitrator if a dispute is ever created. Use
     null when creating non-ERC792 agreements
     @return the agreement id of the newly added agreement*/
@@ -215,7 +212,6 @@ contract AgreementManagerERC20 is AgreementManager {
         string calldata agreementURI,
         address[6] calldata addresses,
         uint[13] calldata quantities,
-        uint /*inputFlags*/,
         bytes calldata arbExtraData
     )
         external
@@ -232,8 +228,16 @@ contract AgreementManagerERC20 is AgreementManager {
             "Token power too large."
         );
         require(
-            quantities[5] <= quantities[0] && quantities[6] <= quantities[1],
-            "Automatic resolution was too large."
+            (
+                addresses[0] != addresses[1] &&
+                addresses[0] != addresses[2] &&
+                addresses[1] != addresses[2]
+            ),
+            "partyA, partyB, and arbitrator addresses must be unique."
+        );
+        require(
+            quantities[7] >= 1 && quantities[7] <= MAX_DAYS_TO_RESPOND_TO_ARBITRATION_REQUEST,
+            "Days to respond to arbitration was out of range."
         );
 
         // Populate a AgreementDataERC20 struct with the info provided.
@@ -252,11 +256,25 @@ contract AgreementManagerERC20 is AgreementManager {
         agreement.resolutionTokenB = RESOLUTION_NULL;
         agreement.partyAStakeAmount = toLargerUnit(quantities[0], quantities[10]);
         agreement.partyBStakeAmount = toLargerUnit(quantities[1], quantities[11]);
+        require(
+            (
+                agreement.partyAStakeAmount < RESOLUTION_NULL &&
+                agreement.partyBStakeAmount < RESOLUTION_NULL
+            ),
+            "Stake amounts were too large. Consider increasing the token powers."
+        );
         agreement.partyAInitialArbitratorFee = toLargerUnit(quantities[2], quantities[12]);
         agreement.partyBInitialArbitratorFee = toLargerUnit(quantities[3], quantities[12]);
         agreement.disputeFee = toLargerUnit(quantities[4], quantities[12]);
         agreement.automaticResolutionTokenA = toLargerUnit(quantities[5], quantities[10]);
         agreement.automaticResolutionTokenB = toLargerUnit(quantities[6], quantities[11]);
+        require(
+            (
+                agreement.automaticResolutionTokenA <= agreement.partyAStakeAmount &&
+                agreement.automaticResolutionTokenB <= agreement.partyBStakeAmount
+            ),
+            "Automatic resolution was too large."
+        );
         agreement.daysToRespondToArbitrationRequest = toUint16(quantities[7]);
         agreement.nextArbitrationStepAllowedAfterTimestamp = toUint32(quantities[8]);
         agreement.autoResolveAfterTimestamp = toUint32(quantities[9]);
@@ -279,13 +297,13 @@ contract AgreementManagerERC20 is AgreementManager {
 
         emitAgreementCreationEvents(agreementID, agreementHash, agreementURI);
 
-        // Verify that partyA paid deposit and fees
-        verifyDeposit_Untrusted(agreements[agreementID], Party.A);
+        // Verify that partyA paid deposit and fees.
+        verifyDeposit_Untrusted_Guarded(agreements[agreementID], Party.A);
 
         // Pay the arbiter if needed, which happens if B was staking no funds and needed no
         // initial fee, but there was an initial fee from A.
         if ((add(quantities[1], quantities[3]) == 0) && (quantities[2] > 0)) {
-            payOutInitialArbitratorFee_Untrusted(agreementID);
+            payOutInitialArbitratorFee_Untrusted_Unguarded(agreements[agreementID]);
         }
 
         return agreementID;
@@ -307,10 +325,10 @@ contract AgreementManagerERC20 is AgreementManager {
 
         emit PartyBDeposited(uint32(agreementID));
 
-        verifyDeposit_Untrusted(agreement, Party.B);
+        verifyDeposit_Untrusted_Guarded(agreement, Party.B);
 
         if (add(agreement.partyAInitialArbitratorFee, agreement.partyBInitialArbitratorFee) > 0) {
-            payOutInitialArbitratorFee_Untrusted(agreementID);
+            payOutInitialArbitratorFee_Untrusted_Unguarded(agreement);
         }
     }
 
@@ -359,6 +377,9 @@ contract AgreementManagerERC20 is AgreementManager {
         if (partyIsCloserToWinningDefaultJudgment(agreementID, agreement, callingParty)) {
             // If new resolution isn't compatible with the existing one, then the caller possibly
             // made the resolution more favorable to themself.
+            // We know that an old resolution exists because for the caller to be closer to
+            // winning a default judgment they must have requested arbitration, and they can only
+            // request arbitration after resolving.
             (uint oldResA, uint oldResB) = partyResolution(agreement, callingParty);
             if (
                 !resolutionsAreCompatibleBothExist(
@@ -391,7 +412,14 @@ contract AgreementManagerERC20 is AgreementManager {
                 callingParty
             )
         ) {
-            finalizeResolution(agreementID, agreement, resA, resB, distributeFunds);
+            finalizeResolution_Untrusted_Unguarded(
+                agreementID,
+                agreement,
+                resA,
+                resB,
+                distributeFunds,
+                false
+            );
         }
     }
 
@@ -414,7 +442,7 @@ contract AgreementManagerERC20 is AgreementManager {
 
         emit PartyAWithdrewEarly(uint32(agreementID));
 
-        executeDistribution_Untrusted(
+        executeDistribution_Untrusted_Unguarded(
             agreement.partyAAddress,
             agreement.partyAToken,
             toWei(agreement.partyAStakeAmount, agreement.partyATokenPower),
@@ -427,19 +455,22 @@ contract AgreementManagerERC20 is AgreementManager {
     /// Each party calls this to withdraw the funds they're entitled to, based on the resolution.
     /// Normally funds are distributed automatically when the agreement gets resolved. However
     /// it is possible for a malicious user to prevent their counterparty from getting an
-    /// automatic distribution, by using an address for the agreement that can't recieve payments.
+    /// automatic distribution, by using an address for the agreement that can't receive payments.
     /// If this happens, the agreement should be resolved by setting the distributeFunds parameter
     /// to false in whichever function is called to resolve the disagreement. Then the parties can
     /// independently extract their funds via this function.
     function withdraw(uint agreementID) external {
         AgreementDataERC20 storage agreement = agreements[agreementID];
         require(!pendingExternalCall(agreement), "Reentrancy protection is on");
-
-        Party callingParty = getCallingParty(agreement);
+        require(agreement.resolutionTokenA != RESOLUTION_NULL, "Agreement not resolved.");
 
         emit PartyWithdrew(uint32(agreementID));
 
-        distributeFundsHelper(agreementID, agreement, callingParty);
+        distributeFundsToPartyHelper_Untrusted_Unguarded(
+            agreementID,
+            agreement,
+            getCallingParty(agreement)
+        );
     }
 
     /// @notice Request that the arbitrator get involved to settle the disagreement.
@@ -472,11 +503,19 @@ contract AgreementManagerERC20 is AgreementManager {
         emit DefaultJudgment(uint32(agreementID));
 
         require(
-            partyFullyPaidDisputeFee_SometimesUntrusted(agreementID, agreement, callingParty),
+            partyFullyPaidDisputeFee_Sometimes_Untrusted_Guarded(
+                agreementID,
+                agreement,
+                callingParty
+            ),
             "Party didn't fully pay the dispute fee."
         );
         require(
-            !partyFullyPaidDisputeFee_SometimesUntrusted(agreementID, agreement, otherParty),
+            !partyFullyPaidDisputeFee_Sometimes_Untrusted_Guarded(
+                agreementID,
+                agreement,
+                otherParty
+            ),
             "Other party fully paid the dispute fee."
         );
 
@@ -485,12 +524,13 @@ contract AgreementManagerERC20 is AgreementManager {
             callingParty
         );
 
-        finalizeResolution(
+        finalizeResolution_Untrusted_Unguarded(
             agreementID,
             agreement,
             partyResA,
             partyResB,
-            distributeFunds
+            distributeFunds,
+            false
         );
     }
 
@@ -525,12 +565,13 @@ contract AgreementManagerERC20 is AgreementManager {
 
         emit AutomaticResolution(uint32(agreementID));
 
-        finalizeResolution(
+        finalizeResolution_Untrusted_Unguarded(
             agreementID,
             agreement,
             agreement.automaticResolutionTokenA,
             agreement.automaticResolutionTokenB,
-            distributeFunds
+            distributeFunds,
+            false
         );
     }
 
@@ -709,14 +750,14 @@ contract AgreementManagerERC20 is AgreementManager {
         return getBool(agreement.boolValues, ARBITRATOR_RESOLVED);
     }
 
-    function arbitratorWithdrewDisputeFee(
+    function arbitratorReceivedDisputeFee(
         AgreementDataERC20 storage agreement
     )
         internal
         view
         returns (bool)
     {
-        return getBool(agreement.boolValues, ARBITRATOR_WITHDREW_DISPUTE_FEE);
+        return getBool(agreement.boolValues, ARBITRATOR_RECEIVED_DISPUTE_FEE);
     }
 
     function partyDisputeFeeLiability(
@@ -825,7 +866,7 @@ contract AgreementManagerERC20 is AgreementManager {
         agreement.boolValues = setBool(agreement.boolValues, ARBITRATOR_RESOLVED, value);
     }
 
-    function setArbitratorWithdrewDisputeFee(
+    function setArbitratorReceivedDisputeFee(
         AgreementDataERC20 storage agreement,
         bool value
     )
@@ -833,7 +874,7 @@ contract AgreementManagerERC20 is AgreementManager {
     {
         agreement.boolValues = setBool(
             agreement.boolValues,
-            ARBITRATOR_WITHDREW_DISPUTE_FEE,
+            ARBITRATOR_RECEIVED_DISPUTE_FEE,
             value
         );
     }
@@ -864,6 +905,19 @@ contract AgreementManagerERC20 is AgreementManager {
         agreement.boolValues = setBool(agreement.boolValues, PENDING_EXTERNAL_CALL, value);
     }
 
+    /// @notice set the value of PENDING_EXTERNAL_CALL and return the previous value.
+    function getThenSetPendingExternalCall(
+        AgreementDataERC20 storage agreement,
+        bool value
+    )
+        internal
+        returns (bool)
+    {
+        uint32 previousBools = agreement.boolValues;
+        agreement.boolValues = setBool(previousBools, PENDING_EXTERNAL_CALL, value);
+        return getBool(previousBools, PENDING_EXTERNAL_CALL);
+    }
+
     // -------------------------------------------------------------------------------------------
     // -------------------------- internal helper functions --------------------------------------
     // -------------------------------------------------------------------------------------------
@@ -871,6 +925,7 @@ contract AgreementManagerERC20 is AgreementManager {
     /// @notice We store ETH/token amounts in uint48s demoninated in larger units of that token.
     /// Specifically, our internal representation is in units of 10^tokenPower wei.
     /// toWei converts from our internal representation to the wei amount.
+    /// @dev This can't overflow. For an explanation of why see the comments for MAX_TOKEN_POWER.
     /// @param value internal value that we want to convert to wei
     /// @param tokenPower The exponent to use to convert our internal representation to wei.
     /// @return the wei value
@@ -880,6 +935,7 @@ contract AgreementManagerERC20 is AgreementManager {
 
     /// @notice Like toWei but resolutionToWei is for "resolution" values which might have a
     /// special value of RESOLUTION_NULL, which we need to handle separately.
+    /// @dev This can't overflow. For an explanation of why see the comments for MAX_TOKEN_POWER.
     /// @param value internal value that we want to convert to wei
     /// @param tokenPower The exponent to use to convert our internal representation to wei.
     /// @return the wei value
@@ -892,6 +948,7 @@ contract AgreementManagerERC20 is AgreementManager {
 
     /// @notice Convert a value expressed in wei to our internal representation (which is
     /// in units of 10^tokenPower wei)
+    /// @dev This can't overflow. For an explanation of why see the comments for MAX_TOKEN_POWER.
     /// @param weiValue wei value that we want to convert from
     /// @param tokenPower The exponent to use to convert wei to our internal representation
     /// @return the amount of our internal units of the given value
@@ -941,22 +998,6 @@ contract AgreementManagerERC20 is AgreementManager {
         }
     }
 
-    /// @notice Assumes that at least one person has resolved.
-    /// @return whether the given party was the last to submit a resolution.
-    function partyResolvedLast(
-        AgreementDataERC20 storage agreement,
-        Party party
-    )
-        internal
-        view
-        returns (bool)
-    {
-        if (partyAResolvedLast(agreement)) {
-            return party == Party.A;
-        }
-        return party == Party.B;
-    }
-
     /// @notice This is a version of resolutionsAreCompatible where we know that both resolutions
     /// are not RESOLUTION_NULL. It's more gas efficient so we should use it when possible.
     /// See comments for resolutionsAreCompatible to understand the purpose and arguments.
@@ -1002,7 +1043,7 @@ contract AgreementManagerERC20 is AgreementManager {
 
     /// @notice Compatible means that the participants don't disagree in a selfish direction.
     /// Alternatively, it means that we know some resolution will satisfy both parties.
-    /// If one person resolves to give the ther person the maximum possible amount, this is
+    /// If one person resolves to give the other person the maximum possible amount, this is
     /// always compatible with the other person's resolution, even if that resolution is
     /// RESOLUTION_NULL. Otherwise, one person having a resolution of RESOLUTION_NULL
     /// implies the resolutions are not compatible.
@@ -1050,8 +1091,8 @@ contract AgreementManagerERC20 is AgreementManager {
             return resolutionTokenA == 0 && resolutionTokenB == 0;
         } else {
             // only the max possible amount from Party B is compatible with RESOLUTION_NULL
-            return otherResolutionTokenA == agreement.partyAStakeAmount &&
-                otherResolutionTokenB == agreement.partyBStakeAmount;
+            return resolutionTokenA == agreement.partyAStakeAmount &&
+                resolutionTokenB == agreement.partyBStakeAmount;
         }
     }
 
@@ -1094,15 +1135,19 @@ contract AgreementManagerERC20 is AgreementManager {
     function storeArbitrationExtraData(uint agreementID, bytes memory arbExtraData) internal;
 
     /// @notice Some inheriting contracts have restrictions on how the arbitrator can be paid.
-    // This enforces those restrictions.
+    /// This enforces those restrictions.
     function checkContractSpecificConditionsForCreation(address arbitratorToken) internal;
 
-    /// @dev 'SometimesUntrusted' means that in some inheriting contracts it's untrusted, in some
-    // it isn't. Look at the implementation in the specific contract you're interested in to know.
-    function partyFullyPaidDisputeFee_SometimesUntrusted(
+    /// @dev '_Sometimes_Untrusted_Guarded' means that in some inheriting contracts it's
+    /// _Untrusted_Guarded, in some it isn't. Look at the implementation in the specific
+    /// contract you're interested in to know.
+    function partyFullyPaidDisputeFee_Sometimes_Untrusted_Guarded(
         uint agreementID,
         AgreementDataERC20 storage agreement,
-        Party party) internal returns (bool);
+        Party party
+    )
+        internal
+        returns (bool);
 
     /// @notice 'Open' means people should be allowed to take steps toward a future resolution.
     /// An agreement isn't open after it has ended (a final resolution exists), or if someone
@@ -1140,15 +1185,17 @@ contract AgreementManagerERC20 is AgreementManager {
     /// @notice When both parties have deposited their stakes, the arbitrator is paid any
     /// 'initial' arbitration fee that was required. We assume we've already checked that the
     /// arbitrator is owed a nonzero amount.
-    function payOutInitialArbitratorFee_Untrusted(uint agreementID) internal {
-        AgreementDataERC20 storage agreement = agreements[agreementID];
-
+    function payOutInitialArbitratorFee_Untrusted_Unguarded(
+        AgreementDataERC20 storage agreement
+    )
+        internal
+    {
         uint totalInitialFeesWei = toWei(
             add(agreement.partyAInitialArbitratorFee, agreement.partyBInitialArbitratorFee),
             agreement.arbitratorTokenPower
         );
 
-        sendFunds_Untrusted(
+        sendFunds_Untrusted_Unguarded(
             agreement.arbitratorAddress,
             agreement.arbitratorToken,
             totalInitialFeesWei
@@ -1159,7 +1206,13 @@ contract AgreementManagerERC20 is AgreementManager {
     /// @param to The address to send the funds.
     /// @param token The address of the token being sent.
     /// @param amount The amount of wei of the token to send.
-    function sendFunds_Untrusted(address to, address token, uint amount) internal {
+    function sendFunds_Untrusted_Unguarded(
+        address to,
+        address token,
+        uint amount
+    )
+        internal
+    {
         if (amount == 0) {
             return;
         }
@@ -1174,7 +1227,12 @@ contract AgreementManagerERC20 is AgreementManager {
     /// @notice Pull ERC20 tokens into this contract from the caller
     /// @param token The address of the token being pulled.
     /// @param amount The amount of wei of the token to pulled.
-    function receiveFunds_Untrusted(address token, uint amount) internal returns (bool) {
+    function receiveFunds_Untrusted_Unguarded(
+        address token,
+        uint amount
+    )
+        internal
+    {
         if (token == address(0)) {
             require(msg.value == amount, "ETH value received was not what was expected.");
         } else if (amount > 0) {
@@ -1183,13 +1241,17 @@ contract AgreementManagerERC20 is AgreementManager {
                 "ERC20 transfer failed."
             );
         }
-        return true;
     }
 
     /// @notice The depositor needs to send their stake amount (in the token they're staking), and
     /// also potentially an initial arbitration fee, in arbitratorToken. This function verifies
     /// that the current transaction has caused those funds to be moved to our contract.
-    function verifyDeposit_Untrusted(AgreementDataERC20 storage agreement, Party party) internal {
+    function verifyDeposit_Untrusted_Guarded(
+        AgreementDataERC20 storage agreement,
+        Party party
+    )
+        internal
+    {
         address partyTokenAddress = partyToken(agreement, party);
 
         // Make sure people don't accidentally send ETH when the only required tokens are ERC20
@@ -1197,9 +1259,12 @@ contract AgreementManagerERC20 is AgreementManager {
             require(msg.value == 0, "ETH was sent, but none was needed.");
         }
 
+        // Wrap these receives in a reentrancy guard. (Technically this shouldn't be necessary,
+        // but that's not obvious enough to make it worth risking a bug.)
+        bool previousValue = getThenSetPendingExternalCall(agreement, true);
         if (partyTokenAddress == agreement.arbitratorToken) {
-            // Both tokens we're recieving are of the same type, so we can do one combined recieve
-            receiveFunds_Untrusted(
+            // Both tokens we're receiving are of the same type, so we can do one combined receive
+            receiveFunds_Untrusted_Unguarded(
                 partyTokenAddress,
                 add(
                     toWei(partyStakeAmount(agreement, party), partyTokenPower(agreement, party)),
@@ -1210,12 +1275,12 @@ contract AgreementManagerERC20 is AgreementManager {
                 )
             );
         } else {
-            // Tokens are of different types, so do one recieve for each.
-            receiveFunds_Untrusted(
+            // Tokens are of different types, so do one receive for each.
+            receiveFunds_Untrusted_Unguarded(
                 partyTokenAddress,
                 toWei(partyStakeAmount(agreement, party), partyTokenPower(agreement, party))
             );
-            receiveFunds_Untrusted(
+            receiveFunds_Untrusted_Unguarded(
                 agreement.arbitratorToken,
                 toWei(
                     partyInitialArbitratorFee(agreement, party),
@@ -1223,6 +1288,7 @@ contract AgreementManagerERC20 is AgreementManager {
                 )
             );
         }
+        setPendingExternalCall(agreement, previousValue);
     }
 
     /// @notice Distribute funds from this contract to the given address, using up to two
@@ -1232,7 +1298,7 @@ contract AgreementManagerERC20 is AgreementManager {
     /// @param amount1 The amount of token1 to distribute in wei
     /// @param token2 The second token address
     /// @param amount2 The amount of token2 to distribute in wei
-    function executeDistribution_Untrusted(
+    function executeDistribution_Untrusted_Unguarded(
         address to,
         address token1,
         uint amount1,
@@ -1241,11 +1307,14 @@ contract AgreementManagerERC20 is AgreementManager {
     )
         internal
     {
+        // All of the calls below are Reentrancy Safe, as they don't depend on any internal state
+        // nor do they modify any state. You can quickly see this by noting that this function
+        // doesn't have access to any references to an agreement, so it can't affect state.
         if (token1 == token2) {
-            sendFunds_Untrusted(to, token1, add(amount1, amount2));
+            sendFunds_Untrusted_Unguarded(to, token1, add(amount1, amount2));
         } else {
-            sendFunds_Untrusted(to, token1, amount1);
-            sendFunds_Untrusted(to, token2, amount2);
+            sendFunds_Untrusted_Unguarded(to, token1, amount1);
+            sendFunds_Untrusted_Unguarded(to, token2, amount2);
         }
     }
 
@@ -1258,7 +1327,7 @@ contract AgreementManagerERC20 is AgreementManager {
     /// @param amount2 The amount of token2 to distribute in wei
     /// @param token3 The third token address
     /// @param amount3 The amount of token3 to distribute in wei
-    function executeDistribution_Untrusted(
+    function executeDistribution_Untrusted_Unguarded(
         address to,
         address token1,
         uint amount1,
@@ -1269,63 +1338,72 @@ contract AgreementManagerERC20 is AgreementManager {
     )
         internal
     {
+        // All of the calls below are Reentrancy Safe, as they don't depend on any internal state
+        // nor do they modify any state. You can quickly see this by noting that this function
+        // doesn't have access to any references to an agreement, so it can't affect state.
+
         // Check for all combinations of which tokens are the same, to minimize the amount of
         // transfers.
         if (token1 == token2 && token1 == token3) {
-            sendFunds_Untrusted(to, token1, add(amount1, add(amount2, amount3)));
+            sendFunds_Untrusted_Unguarded(to, token1, add(amount1, add(amount2, amount3)));
         } else if (token1 == token2) {
-            sendFunds_Untrusted(to, token1, add(amount1, amount2));
-            sendFunds_Untrusted(to, token3, amount3);
+            sendFunds_Untrusted_Unguarded(to, token1, add(amount1, amount2));
+            sendFunds_Untrusted_Unguarded(to, token3, amount3);
         } else if (token1 == token3) {
-            sendFunds_Untrusted(to, token1, add(amount1, amount3));
-            sendFunds_Untrusted(to, token2, amount2);
+            sendFunds_Untrusted_Unguarded(to, token1, add(amount1, amount3));
+            sendFunds_Untrusted_Unguarded(to, token2, amount2);
         } else if (token2 == token3) {
-            sendFunds_Untrusted(to, token1, amount1);
-            sendFunds_Untrusted(to, token2, add(amount2, amount3));
+            sendFunds_Untrusted_Unguarded(to, token1, amount1);
+            sendFunds_Untrusted_Unguarded(to, token2, add(amount2, amount3));
         } else {
-            sendFunds_Untrusted(to, token1, amount1);
-            sendFunds_Untrusted(to, token2, amount2);
-            sendFunds_Untrusted(to, token3, amount3);
+            sendFunds_Untrusted_Unguarded(to, token1, amount1);
+            sendFunds_Untrusted_Unguarded(to, token2, amount2);
+            sendFunds_Untrusted_Unguarded(to, token3, amount3);
         }
     }
 
     /// @notice A helper function that sets the final resolution for the agreement, and
-    /// also distributes funds to the participants if 'distribute' is true.
-    function finalizeResolution(
+    /// also distributes funds to the participants based on distributeFundsToParties and
+    /// distributeFundsToArbitrator.
+    function finalizeResolution_Untrusted_Unguarded(
         uint agreementID,
         AgreementDataERC20 storage agreement,
         uint48 resA,
         uint48 resB,
-        bool distributeFunds
+        bool distributeFundsToParties,
+        bool distributeFundsToArbitrator
     )
         internal
     {
         agreement.resolutionTokenA = resA;
         agreement.resolutionTokenB = resB;
         calculateDisputeFeeLiability(agreementID, agreement);
-        if (distributeFunds) {
+        if (distributeFundsToParties) {
             emit FundsDistributed(uint32(agreementID));
-            distributeFundsHelper(agreementID, agreement, Party.A);
-            distributeFundsHelper(agreementID, agreement, Party.B);
+            // These calls are not "Reentrancy Safe" (see AgreementManager.sol comments).
+            // Using reentrancy guard.
+            bool previousValue = getThenSetPendingExternalCall(agreement, true);
+            distributeFundsToPartyHelper_Untrusted_Unguarded(agreementID, agreement, Party.A);
+            distributeFundsToPartyHelper_Untrusted_Unguarded(agreementID, agreement, Party.B);
+            setPendingExternalCall(agreement, previousValue);
+        }
+        if (distributeFundsToArbitrator) {
+            distributeFundsToArbitratorHelper_Untrusted_Unguarded(agreementID, agreement);
         }
     }
 
     /// @notice This can only be called after a resolution is established.
     /// A helper function to distribute funds owed to a party based on the resolution and any
     /// arbitration fee refund they're owed.
-    function distributeFundsHelper(
+    /// Assumes that a resolution exists.
+    function distributeFundsToPartyHelper_Untrusted_Unguarded(
         uint agreementID,
         AgreementDataERC20 storage agreement,
         Party party
     )
         internal
     {
-        require(agreement.resolutionTokenA != RESOLUTION_NULL, "Agreement not resolved.");
-        require(
-            !partyReceivedDistribution(agreement, party),
-            "Party already received funds."
-        );
-
+        require(!partyReceivedDistribution(agreement, party), "party already received funds.");
         setPartyReceivedDistribution(agreement, party, true);
 
         uint distributionAmountA = 0;
@@ -1340,11 +1418,31 @@ contract AgreementManagerERC20 is AgreementManager {
 
         uint arbRefundWei = getPartyArbitrationRefundInWei(agreementID, agreement, party);
 
-        executeDistribution_Untrusted(
+        executeDistribution_Untrusted_Unguarded(
             partyAddress(agreement, party),
             agreement.partyAToken, toWei(distributionAmountA, agreement.partyATokenPower),
             agreement.partyBToken, toWei(distributionAmountB, agreement.partyBTokenPower),
             agreement.arbitratorToken, arbRefundWei);
+    }
+
+    /// @notice A helper function to distribute funds owed to the arbitrator. These funds can be
+    /// distributed either when the arbitrator calls withdrawDisputeFee or resolveAsArbitrator.
+    function distributeFundsToArbitratorHelper_Untrusted_Unguarded(
+        uint agreementID,
+        AgreementDataERC20 storage agreement
+    )
+        internal
+    {
+        require(!arbitratorReceivedDisputeFee(agreement), "Already received dispute fee.");
+        setArbitratorReceivedDisputeFee(agreement, true);
+
+        emit ArbitratorReceivedDisputeFee(uint32(agreementID));
+
+        sendFunds_Untrusted_Unguarded(
+            agreement.arbitratorAddress,
+            agreement.arbitratorToken,
+            toWei(agreement.disputeFee, agreement.arbitratorTokenPower)
+        );
     }
 
     /// @notice Calculate and store in state variables who is responsible for paying any

@@ -50,5 +50,5 @@ contract ERC792ArbitrationInterface is Arbitrable {
 
     // When we get a 'ruling' from an ERC-792 arbitrator, they'll only pass back the disputeID.
     // We need this mapping so we can find the agreement corresponding to that disputeID.
-    mapping(address => mapping(uint => uint)) disputeToAgremeentID;
+    mapping(address => mapping(uint => uint)) disputeToAgreementID;
 }

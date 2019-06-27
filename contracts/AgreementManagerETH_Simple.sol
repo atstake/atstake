@@ -20,7 +20,8 @@ import "./SimpleArbitrationInterface.sol";
     a small amount of code duplication for non-ERC792 arbitration.
 
     There should be no risk of re-entrancy attacks in this contract, since it makes no external
-    calls aside from ETH transfers which always occur at the end of functions.
+    calls aside from ETH transfers which always occur in ways that are Reentrancy Safe (see the
+    comments in AgreementManager.sol for the meaning of "Reentrancy Safe").
 */
 
 contract AgreementManagerETH_Simple is AgreementManagerETH, SimpleArbitrationInterface {
@@ -41,12 +42,12 @@ contract AgreementManagerETH_Simple is AgreementManagerETH, SimpleArbitrationInt
     )
         external
         view
-        returns (address[3] memory, uint[16] memory, bool[11] memory, bytes memory)
+        returns (address[3] memory, uint[16] memory, bool[12] memory, bytes memory)
     {
         if (agreementID >= agreements.length) {
             address[3] memory zeroAddrs;
             uint[16] memory zeroUints;
-            bool[11] memory zeroBools;
+            bool[12] memory zeroBools;
             bytes memory zeroBytes;
             return (zeroAddrs, zeroUints, zeroBools, zeroBytes);
         }
@@ -78,7 +79,7 @@ contract AgreementManagerETH_Simple is AgreementManagerETH, SimpleArbitrationInt
             0,
             0
         ];
-        bool[11] memory boolVals = [
+        bool[12] memory boolVals = [
             partyStakePaid(agreement, Party.A),
             partyStakePaid(agreement, Party.B),
             partyRequestedArbitration(agreement, Party.A),
@@ -87,10 +88,11 @@ contract AgreementManagerETH_Simple is AgreementManagerETH, SimpleArbitrationInt
             partyReceivedDistribution(agreement, Party.B),
             partyAResolvedLast(agreement),
             arbitratorResolved(agreement),
-            arbitratorWithdrewDisputeFee(agreement),
-            // Return some false values where the ERC792 arbitration data is so we can have the
+            arbitratorReceivedDisputeFee(agreement),
+            partyDisputeFeeLiability(agreement, Party.A),
+            partyDisputeFeeLiability(agreement, Party.B),
+            // Return a false value where the ERC792 arbitration data is so we can have the
             // same API for all contracts.
-            false,
             false
         ];
         // Return empty bytes value to keep the same API as for the ERC792 version
@@ -107,7 +109,8 @@ contract AgreementManagerETH_Simple is AgreementManagerETH, SimpleArbitrationInt
     /// Can only be called after arbitrator is asked to arbitrate by both parties.
     /// @param resolutionWei The amount of wei that the caller thinks should go to party A.
     /// The remaining amount of wei staked for this agreement would go to party B.
-    /// @param distributeFunds Whether to distribute funds to both parties
+    /// @param distributeFunds Whether to distribute funds to both parties and the arbitrator (if
+    /// the arbitrator hasn't already called withdrawDisputeFee).
     function resolveAsArbitrator(
         uint agreementID,
         uint resolutionWei,
@@ -117,6 +120,7 @@ contract AgreementManagerETH_Simple is AgreementManagerETH, SimpleArbitrationInt
     {
         AgreementDataETH storage agreement = agreements[agreementID];
 
+        require(!pendingExternalCall(agreement), "Reentrancy protection is on");
         require(agreementIsOpen(agreement), "Agreement not open.");
         require(agreementIsLockedIn(agreement), "Agreement not locked in.");
 
@@ -142,7 +146,15 @@ contract AgreementManagerETH_Simple is AgreementManagerETH, SimpleArbitrationInt
 
         emit ArbitratorResolved(uint32(agreementID), resolutionWei);
 
-        finalizeResolution(agreementID, agreement, res, distributeFunds);
+        bool distributeToArbitrator = !arbitratorReceivedDisputeFee(agreement) && distributeFunds;
+
+        finalizeResolution_Untrusted_Unguarded(
+            agreementID,
+            agreement,
+            res,
+            distributeFunds,
+            distributeToArbitrator
+        );
     }
 
     /// @notice Request that the arbitrator get involved to settle the disagreement.
@@ -153,6 +165,7 @@ contract AgreementManagerETH_Simple is AgreementManagerETH, SimpleArbitrationInt
     function requestArbitration(uint agreementID) external payable {
         AgreementDataETH storage agreement = agreements[agreementID];
 
+        require(!pendingExternalCall(agreement), "Reentrancy protection is on");
         require(agreementIsOpen(agreement), "Agreement not open.");
         require(agreementIsLockedIn(agreement), "Agreement not locked in.");
         require(agreement.arbitratorAddress != address(0), "Arbitration is disallowed.");
@@ -205,6 +218,7 @@ contract AgreementManagerETH_Simple is AgreementManagerETH, SimpleArbitrationInt
     function withdrawDisputeFee(uint agreementID) external {
         AgreementDataETH storage agreement = agreements[agreementID];
 
+        require(!pendingExternalCall(agreement), "Reentrancy protection is on");
         require(
             (
                 partyRequestedArbitration(agreement, Party.A) &&
@@ -224,13 +238,8 @@ contract AgreementManagerETH_Simple is AgreementManagerETH, SimpleArbitrationInt
             ),
             "partyA and partyB already resolved their dispute."
         );
-        require(!arbitratorWithdrewDisputeFee(agreement), "Already withdrew dispute fee.");
 
-        setArbitratorWithdrewDisputeFee(agreement, true);
-
-        emit DisputeFeeWithdrawn(uint32(agreementID));
-
-        msg.sender.transfer(toWei(agreement.disputeFee));
+        distributeFundsToArbitratorHelper_Untrusted_Unguarded(agreementID, agreement);
     }
 
     // -------------------------------------------------------------------------------------------
@@ -239,7 +248,7 @@ contract AgreementManagerETH_Simple is AgreementManagerETH, SimpleArbitrationInt
 
     /// @dev This function is NOT untrusted in this contract.
     /// @return whether the given party has paid the arbitration fee in full.
-    function partyFullyPaidDisputeFee_SometimesUntrusted(
+    function partyFullyPaidDisputeFee_Sometimes_Untrusted_Guarded(
         uint, /*agreementID is unused in this version*/
         AgreementDataETH storage agreement,
         Party party) internal returns (bool) {
@@ -308,6 +317,6 @@ contract AgreementManagerETH_Simple is AgreementManagerETH, SimpleArbitrationInt
         internal
         returns (bool)
     {
-        return arbitratorResolved(agreement) || arbitratorWithdrewDisputeFee(agreement);
+        return arbitratorResolved(agreement) || arbitratorReceivedDisputeFee(agreement);
     }
 }

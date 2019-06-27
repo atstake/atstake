@@ -9,16 +9,10 @@ pragma solidity 0.5.3;
 
 contract SimpleArbitrationInterface {
     // -------------------------------------------------------------------------------------------
-    // ------------------------------------- events ----------------------------------------------
-    // -------------------------------------------------------------------------------------------
-
-    event DisputeFeeWithdrawn(uint32 indexed agreementID);
-
-    // -------------------------------------------------------------------------------------------
     // ----------------------------- internal helper functions -----------------------------------
     // -------------------------------------------------------------------------------------------
 
-    /// @dev This is a no-op when using simlple arbitration.
+    /// @dev This is a no-op when using simple arbitration.
     /// Extra arbitration data is only needed for ERC792 arbitration.
     function storeArbitrationExtraData(uint, bytes memory) internal { }
 }

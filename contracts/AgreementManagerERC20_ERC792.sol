@@ -28,9 +28,8 @@ import "./ERC792ArbitrationInterface.sol";
     to be 'locked in', so we don't need to protect functions that aren't callable after the
     agreement is locked in (like earlyWithdrawA and depositB)
 
-    For ease of review, functions that call untrusted external functions (even via multiple calls)
-    will have "_Untrusted" or "_SometimesUntrusted" appended to the function name, except if that
-    function is directly callable by an external party.
+    Search AgreementManager.sol for "NOTES ON REENTRANCY" to learn more about our reentrancy
+    protection strategy.
 */
 
 contract AgreementManagerERC20_ERC792 is AgreementManagerERC20, ERC792ArbitrationInterface {
@@ -56,12 +55,12 @@ contract AgreementManagerERC20_ERC792 is AgreementManagerERC20, ERC792Arbitratio
     )
         external
         view
-        returns (address[6] memory, uint[23] memory, bool[11] memory, bytes memory)
+        returns (address[6] memory, uint[23] memory, bool[12] memory, bytes memory)
     {
         if (agreementID >= agreements.length) {
             address[6] memory zeroAddrs;
             uint[23] memory zeroUints;
-            bool[11] memory zeroBools;
+            bool[12] memory zeroBools;
             bytes memory zeroBytes;
             return (zeroAddrs, zeroUints, zeroBools, zeroBytes);
         }
@@ -102,7 +101,7 @@ contract AgreementManagerERC20_ERC792 is AgreementManagerERC20, ERC792Arbitratio
             arbData.weiPaidToArbitrator,
             arbData.disputeID
         ];
-        bool[11] memory boolVals = [
+        bool[12] memory boolVals = [
             partyStakePaid(agreement, Party.A),
             partyStakePaid(agreement, Party.B),
             partyRequestedArbitration(agreement, Party.A),
@@ -111,8 +110,9 @@ contract AgreementManagerERC20_ERC792 is AgreementManagerERC20, ERC792Arbitratio
             partyReceivedDistribution(agreement, Party.B),
             partyAResolvedLast(agreement),
             arbitratorResolved(agreement),
-            arbitratorWithdrewDisputeFee(agreement),
-            true, // Indicates whether this uses ERC792 arbitration
+            arbitratorReceivedDisputeFee(agreement),
+            partyDisputeFeeLiability(agreement, Party.A),
+            partyDisputeFeeLiability(agreement, Party.B),
             arbData.disputeCreated
         ];
         bytes memory bytesVal = arbitrationExtraData[agreementID];
@@ -135,7 +135,7 @@ contract AgreementManagerERC20_ERC792 is AgreementManagerERC20, ERC792Arbitratio
     /// rulings should have been given in the MetaEvidence event that was emitted when the
     /// agreement was created
     function rule(uint dispute_id, uint ruling) public {
-        uint agreementID = disputeToAgremeentID[msg.sender][dispute_id];
+        uint agreementID = disputeToAgreementID[msg.sender][dispute_id];
         require(agreementID > 0, "Dispute doesn't correspond to a valid agreement.");
 
         AgreementDataERC20 storage agreement = agreements[agreementID];
@@ -158,43 +158,48 @@ contract AgreementManagerERC20_ERC792 is AgreementManagerERC20, ERC792Arbitratio
             // Do nothing. We already updated state with setArbitratorResolved.
             // Resolving as None can be interpreted as the arbitrator refusing to rule.
         } else if (ruling == uint(PredefinedResolution.Refund)) {
-            finalizeResolution(
+            finalizeResolution_Untrusted_Unguarded(
                 agreementID,
                 agreement,
                 agreement.partyAStakeAmount,
                 0,
+                false,
                 false
             );
         } else if (ruling == uint(PredefinedResolution.EverythingToA)) {
-            finalizeResolution(
+            finalizeResolution_Untrusted_Unguarded(
                 agreementID,
                 agreement,
                 agreement.partyAStakeAmount,
                 agreement.partyBStakeAmount,
+                false,
                 false
             );
         } else if (ruling == uint(PredefinedResolution.EverythingToB)) {
-            finalizeResolution(
+            finalizeResolution_Untrusted_Unguarded(
                 agreementID,
                 agreement,
                 0,
                 0,
+                false,
                 false
             );
         } else if (ruling == uint(PredefinedResolution.Swap)) {
-            finalizeResolution(
+            finalizeResolution_Untrusted_Unguarded(
                 agreementID,
                 agreement,
                 0,
                 agreement.partyBStakeAmount,
+                false,
                 false
             );
         } else if (ruling == uint(PredefinedResolution.FiftyFifty)) {
-            finalizeResolution(
+            finalizeResolution_Untrusted_Unguarded(
                 agreementID,
                 agreement,
                 agreement.partyAStakeAmount/2,
                 agreement.partyBStakeAmount/2,
+                false,
                 false
             );
         } else {
@@ -252,7 +257,7 @@ contract AgreementManagerERC20_ERC792 is AgreementManagerERC20, ERC792Arbitratio
             arbData.weiPaidIn[uint(callingParty)],
             msg.value
         );
-        uint arbitrationFee = standardArbitrationFee_Untrusted(
+        uint arbitrationFee = standardArbitrationFee_Untrusted_Guarded(
             agreement,
             arbitrationExtraData[agreementID]
         );
@@ -266,13 +271,13 @@ contract AgreementManagerERC20_ERC792 is AgreementManagerERC20, ERC792Arbitratio
             // Both parties have paid at least the arbitrationFee, so create a dispute.
             arbData.disputeCreated = true;
             arbData.weiPaidToArbitrator = arbitrationFee;
-            arbData.disputeID = createDispute_Untrusted(
+            arbData.disputeID = createDispute_Untrusted_Guarded(
                 agreement,
                 NUM_STANDARD_RESOLUTION_TYPES,
                 arbitrationExtraData[agreementID],
                 arbitrationFee
             );
-            disputeToAgremeentID[agreement.arbitratorAddress][arbData.disputeID] = agreementID;
+            disputeToAgreementID[agreement.arbitratorAddress][arbData.disputeID] = agreementID;
             emit Dispute(
                 Arbitrator(agreement.arbitratorAddress),
                 arbData.disputeID,
@@ -298,7 +303,8 @@ contract AgreementManagerERC20_ERC792 is AgreementManagerERC20, ERC792Arbitratio
     // ----------------------------- internal helper functions -----------------------------------
     // -------------------------------------------------------------------------------------------
 
-    /// @dev This is a no-op in this version of the contract. It exists because we use inheritance
+    /// @dev Store extraData in our state. This is a function because we use inheritance and
+    /// we want it to be a no-op when we're not using ERC792 arbitration.
     function storeArbitrationExtraData(uint agreementID, bytes memory arbExtraData) internal {
         arbitrationExtraData[agreementID] = arbExtraData;
      }
@@ -311,9 +317,9 @@ contract AgreementManagerERC20_ERC792 is AgreementManagerERC20, ERC792Arbitratio
         );
     }
 
-    /// @dev This function is untrusted in this contract.
+    /// @dev This function is _Untrusted_Guarded in this contract.
     /// @return whether the given party has paid the arbitration fee in full.
-    function partyFullyPaidDisputeFee_SometimesUntrusted(
+    function partyFullyPaidDisputeFee_Sometimes_Untrusted_Guarded(
         uint agreementID,
         AgreementDataERC20 storage agreement,
         Party party
@@ -325,7 +331,7 @@ contract AgreementManagerERC20_ERC792 is AgreementManagerERC20, ERC792Arbitratio
         if (arbData.disputeCreated) {
             return true;
         }
-        uint arbitrationFee = standardArbitrationFee_Untrusted(
+        uint arbitrationFee = standardArbitrationFee_Untrusted_Guarded(
             agreement,
             arbitrationExtraData[agreementID]
         );
@@ -337,7 +343,7 @@ contract AgreementManagerERC20_ERC792 is AgreementManagerERC20, ERC792Arbitratio
     /// it in a reentrancy guard.
     /// @param extraData is some data that the arbitration service should understand. It may
     /// control what type of arbitration is being requested, so the fee can vary based on it.
-    function standardArbitrationFee_Untrusted(
+    function standardArbitrationFee_Untrusted_Guarded(
         AgreementDataERC20 storage agreement,
         bytes memory extraData
     )
@@ -345,9 +351,9 @@ contract AgreementManagerERC20_ERC792 is AgreementManagerERC20, ERC792Arbitratio
         returns (uint)
     {
         // Unsafe external call. Using reentrancy guard.
-        setPendingExternalCall(agreement, true);
+        bool previousValue = getThenSetPendingExternalCall(agreement, true);
         uint cost = Arbitrator(agreement.arbitratorAddress).arbitrationCost(extraData);
-        setPendingExternalCall(agreement, false);
+        setPendingExternalCall(agreement, previousValue);
 
         return cost;
     }
@@ -363,7 +369,7 @@ contract AgreementManagerERC20_ERC792 is AgreementManagerERC20, ERC792Arbitratio
     /// @param extraData Details about how the dispute should be arbitrated. Sent in whatever
     /// format the arbitration service understands.
     /// @return An ID given to our dispute by the arbitration service.
-    function createDispute_Untrusted(
+    function createDispute_Untrusted_Guarded(
         AgreementDataERC20 storage agreement,
         uint nChoices,
         bytes memory extraData,
@@ -373,11 +379,11 @@ contract AgreementManagerERC20_ERC792 is AgreementManagerERC20, ERC792Arbitratio
         returns (uint)
     {
         // Unsafe external call. Using reentrancy guard.
-        setPendingExternalCall(agreement, true);
+        bool previousValue = getThenSetPendingExternalCall(agreement, true);
         uint disputeID = Arbitrator(
             agreement.arbitratorAddress
         ).createDispute.value(arbFee)(nChoices, extraData);
-        setPendingExternalCall(agreement, false);
+        setPendingExternalCall(agreement, previousValue);
 
         return disputeID;
     }

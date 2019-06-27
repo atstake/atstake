@@ -32,14 +32,42 @@ import "./EvidenceProducer.sol";
     shared. AgreementManagerERC20 can handle purely ETH agreements, but it's cheaper to use
     AgreementManagerETH.
 
-    For ease of review, functions that call untrusted external functions (even via multiple calls)
-    will have "_Untrusted" appended to the function name, except if that function is directly
-    callable by an external party.
-
     To avoid comment duplication, comments have been pushed as high in the inheritance tree as
     possible. Several functions are declared for the first time in AgreementManagerETH and
     AgreementManagerERC20 rather than in AgreementManager, because they take slightly different
     arguments.
+
+    **** NOTES ON REENTRANCY ****
+
+    For ease of review, functions that call untrusted external functions (even via multiple calls)
+    and which have these external calls wrapped in a reentrancy guard will have
+    "_Untrusted_Guarded" appended to the function name. Untrusted functions which don't have their
+    external calls wrapped in a reentrancy guard will have _Untrusted_Unguarded appended to their
+    name. One function has "_Sometimes_Untrusted_Guarded" appended to its name, as it's
+    _Untrusted_Guarded untrusted in some inheriting functions. This naming convention does not
+    apply to public and external functions.
+
+    An external function call is safe if (a) nothing after the function call depends on any
+    contract state that can change after the call is made, and (b) no contract state will be
+    changed after the external call. When those two conditions don't obviously hold we use a
+    reentrancy guard. When those two conditions do hold we safely ignore reentrancy protection.
+    We'll refer to calls that clearly meet both conditions as being "Reentrancy Safe" in other
+    comments.
+
+    You can prove to yourself that our code is reentrancy safe by verifying these things:
+    (1) Every function whose name ends with "_Untrusted_Guarded" has a reentrancy guard wrapped
+    around any external calls that it contains.
+    (2) Every function call whose name ends with "_Untrusted_Unguarded" is either Reentrancy Safe
+    as described above, or it's wrapped in a reentrancy guard.
+    (3) The body of every function whose name ends with "_Untrusted_Unguarded" contains only
+    Reentrancy Safe calls.
+    (4) Every external function in our contracts that modifies the state of a pre-existing
+    agreement is protected by a reentrancy check.
+
+    Note that a reentrancy guard looks like "getThenSetPendingExternalCall(agreement, true)"
+    before the code that it's guarding, and "setPendingExternalCall(agreement, previousValue)"
+    after the code that it's guarding. A reentrancy check looks like:
+    'require(!pendingExternalCall(agreement), "Reentrancy protection is on");'
 */
 
 contract AgreementManager is SafeUtils, EvidenceProducer {
@@ -51,6 +79,8 @@ contract AgreementManager is SafeUtils, EvidenceProducer {
     // the amount of wei that party A should get. Party B is understood to get the remaining wei.
     // RESOLUTION_NULL is a special value indicating "no resolution has been entered yet".
     uint48 constant RESOLUTION_NULL = ~(uint48(0)); // set all bits to one.
+
+    uint constant MAX_DAYS_TO_RESPOND_TO_ARBITRATION_REQUEST = 365*30; // Approximately 30 years
 
     // "party A" and "party B" are the two parties to the agreement
     enum Party { A, B }
@@ -81,7 +111,7 @@ contract AgreementManager is SafeUtils, EvidenceProducer {
     the arbitration fee.*/
     uint constant PARTY_A_RESOLVED_LAST = 6;
     uint constant ARBITRATOR_RESOLVED = 7; // Did the arbitrator enter a resolution?
-    uint constant ARBITRATOR_WITHDREW_DISPUTE_FEE = 8; // Did arbitrator withdraw the dispute fee?
+    uint constant ARBITRATOR_RECEIVED_DISPUTE_FEE = 8; // Did arbitrator receive the dispute fee?
     // The DISPUTE_FEE_LIABILITY are used to keep track if which party is responsible for paying
     // the arbitrator's dispute fee. If both are true then each party is responsible for half.
     uint constant PARTY_A_DISPUTE_FEE_LIABILITY = 9;
@@ -104,9 +134,18 @@ contract AgreementManager is SafeUtils, EvidenceProducer {
     event PartyAWithdrewEarly(uint32 indexed agreementID);
     event PartyWithdrew(uint32 indexed agreementID);
     event FundsDistributed(uint32 indexed agreementID);
+    event ArbitratorReceivedDisputeFee(uint32 indexed agreementID);
     event ArbitrationRequested(uint32 indexed agreementID);
     event DefaultJudgment(uint32 indexed agreementID);
     event AutomaticResolution(uint32 indexed agreementID);
+
+    // -------------------------------------------------------------------------------------------
+    // --------------------------- public / external functions -----------------------------------
+    // -------------------------------------------------------------------------------------------
+
+    /// @notice A fallback function that prevents anyone from sending ETH directly to this
+    /// and inheriting contracts, since it isn't payable.
+    function () external {}
 
     // -------------------------------------------------------------------------------------------
     // ----------------------- internal getter and setter functions ------------------------------
