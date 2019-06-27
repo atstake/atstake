@@ -1,4 +1,4 @@
-# Interacting with your agreements without the Atstake site
+# Interacting with your agreements without Atstake
 
 If the Atstake website is ever offline, you can use the following instructions to continue interacting with the AgreementManager contracts. You may want to store a private copy of these instructions in case this repo ever becomes unavailable.
 
