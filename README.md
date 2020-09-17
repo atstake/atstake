@@ -1,6 +1,6 @@
 # Ethereum contracts used by Atstake
 
-This repository contains all of the Ethereum contracts used by Atstake. We encourage our users to carefully review these contracts to gain confidence in the security of your agreements.
+This repository contains all of the Ethereum contracts used by [Atstake](https://atstake.net). We encourage our users to carefully review these contracts to gain confidence in the security of your agreements.
 
 All the solidity contracts are in the 'contracts' directory. Read the comments at the top of AgreementManager.sol for an overview of all contracts.
 
